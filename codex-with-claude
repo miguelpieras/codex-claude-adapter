@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+adapter_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+adapter_python=${CODEX_ADAPTER_PYTHON:-python3}
+if ! "$adapter_python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    echo 'Python 3.11+ is required. Set CODEX_ADAPTER_PYTHON to its executable.' >&2
+    exit 1
+fi
+if [ "${1:-}" = '--adapter-action' ]; then
+    shift
+    exec "$adapter_python" "$adapter_dir/manage.py" "$@"
+fi
+exec "$adapter_python" "$adapter_dir/adapter.py" "$@"

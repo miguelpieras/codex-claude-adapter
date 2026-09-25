@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.env
+.env.*
+!.env.example
+runtime/
+*.log
+*.sqlite*
+*.jsonl
+auth.json
+models_cache.json
+models.json
+restore.json
+preferences.json
+bridge-token

@@ -1,0 +1,136 @@
+# Codex Claude Adapter
+
+Run **Claude Opus 5.5 through your local Claude Code login** in the Codex desktop model picker, while native Codex tasks keep their normal provider.
+
+Experimental, macOS-only, and unofficial. This project is not affiliated with OpenAI or Anthropic. It contains adapter code only; neither product's binaries, credentials, model catalog, nor proprietary prompts are distributed. Their respective access requirements and terms still apply.
+
+## What it does
+
+- Adds **Claude Opus 5.5 · Claude Code** to the model picker during an opt-in launch.
+- Switches idle tasks between native Codex and Opus while retaining saved conversation history.
+- Runs separate Claude sessions for concurrent Opus tasks.
+- Uses Claude Code's native tools and subagents. Subagents are pinned to the same Opus model.
+- Makes UI side chats inherit Opus, with read-only tools.
+- Restores saved task providers before returning to stock Codex or removing runtime files.
+
+It does **not** patch the app bundle or replace the global Codex provider. Claude inference uses the official local CLI. Inherited API-key/provider overrides are stripped, subscription authentication is checked, and there is no API-key or OpenAI inference fallback in that backend.
+
+## Requirements
+
+- macOS with Codex desktop installed and opened at least once while signed in, so its model catalog is available.
+- Python **3.11+**. Only the standard library is used; no `pip install` is needed.
+- Claude Code installed and signed into an eligible Claude subscription, with access to Opus 5.5.
+- A native Codex global provider. Other custom global providers are not supported.
+
+The implementation has been tested with Codex CLI **0.155.0-alpha.16.4** bundled with the desktop app, and Claude Code **2.1.282**. It uses experimental desktop APIs; compatibility with other versions is not established.
+
+## Start
+
+```sh
+git clone https://github.com/miguelpieras/codex-claude-adapter.git
+cd codex-claude-adapter
+claude auth status
+python3 manage.py status
+```
+
+Let active tasks finish, then **quit Codex completely** and run:
+
+```sh
+python3 manage.py launch
+```
+
+Choose **Claude Opus 5.5 · Claude Code** in the dropdown. The `Start Codex with Opus.command` launcher does the same thing.
+
+The launcher passes `CODEX_CLI_PATH` to that app process only. Normal Codex launches do not inherit it. Opus default preferences are stored separately from normal Codex settings.
+
+Application discovery checks `/Applications` and `~/Applications` for `Codex.app` or a Codex distribution named `ChatGPT.app`, verifying the Codex bundle identifier. The ordinary ChatGPT app is not supported. Optional overrides:
+
+```sh
+export CODEX_ADAPTER_APP='/custom/location/Codex.app'
+export CODEX_ADAPTER_CLAUDE="$HOME/.local/bin/claude"
+export CODEX_ADAPTER_PYTHON='/path/to/python3'
+python3 manage.py launch
+```
+
+`CODEX_HOME` is respected. Generated state lives in `$CODEX_HOME/claude-adapter`, or `~/.codex/claude-adapter` by default. Keep this source checkout available while using the adapter. No LaunchAgent or persistent background service is installed.
+
+## Restore or remove
+
+**Quit Codex first.** Neither command force-stops running work.
+
+```sh
+# Restore saved tasks and open stock Codex:
+python3 manage.py standard
+
+# Or restore tasks and remove all generated adapter state:
+python3 manage.py uninstall
+```
+
+The equivalent Finder launchers are `Restore Standard Codex.command` and `Remove Claude Adapter.command`.
+
+Restoration uses the bundled app-server's task APIs, including for archived tasks. It verifies that no saved task still references this provider before removal. If restoration fails, state is retained so you can retry. No backups or snapshots are created, and the task database is never edited directly.
+
+After successful uninstall, delete this source checkout if you no longer want it. The command deliberately does not delete source code, Git history, or sibling folders. Your Codex conversations, ordinary Claude Code transcripts, Claude installation and login are retained.
+
+Normal wrapper shutdown also attempts restoration. **After a crash or forced quit, run `python3 manage.py standard` before opening stock Codex.** Do not delete the checkout or runtime directory first: saved tasks may still require migration.
+
+## Tools, permissions and limits
+
+**Claude Code owns native tool execution and approvals.** It runs in `auto` permission mode, without `--dangerously-skip-permissions`. Requests requiring interactive approval are denied and reported because this adapter does not yet display Claude permission prompts. Its automatic permission classifier may be another Anthropic model; the Opus pin applies to the task and native subagents, not that classifier.
+
+Claude runs in safe mode with strict MCP configuration. Built-in tools and native agents remain available; custom Claude plugins, hooks, commands, MCP servers and configuration extensions are disabled. Codex project instructions are supplied as conversation context. Native tool progress appears as commentary; it is not executed a second time by Codex.
+
+Codex's OS sandbox and approval reviewer do **not** govern native Claude tools. Read-only tasks and ephemeral side chats restrict native tools to Read/Glob/Grep. Side-chat editing and subagents are currently unavailable. Choose named Codex permission profiles before starting an Opus task; changing profiles mid-task is unsupported.
+
+Other limitations:
+
+- Local interactive text tasks only; no remote-host or scheduled-task integration.
+- Codex app tools, connectors and browser/computer tools are not forwarded to Claude.
+- Voice is blocked in Opus tasks because it uses OpenAI. Native Codex tasks retain their native route.
+- General Codex image/audio attachments are not supported. Claude can inspect local files with its own tools.
+- Codex review and compaction commands are not integrated. The advertised Codex context budget is 100k tokens.
+- Stop a running turn before changing its provider. A failed/interrupted request is not automatically replayed, to avoid repeating tool side effects.
+- The CLI's usage limits still apply. No performance, billing savings, or compatibility beyond the tested versions is promised.
+
+The no-fallback property describes adapter inference routing. It is not a network firewall preventing arbitrary user-requested shell commands from calling other services.
+
+## How it works
+
+```text
+Codex desktop (process-local CLI override)
+  └─ Python JSON-RPC wrapper
+      ├─ native task → bundled Codex → native provider
+      └─ Opus task   → task-specific custom provider
+                      → authenticated loopback Responses endpoint
+                      → local Claude Code session and native tools
+```
+
+The wrapper adds a temporary model catalog, explicitly selects the provider on task creation/resume/fork, and reloads an idle task when its provider changes. It verifies the selected provider before sending a turn. A local token authenticates the loopback endpoint. Original model/provider choices are retained for rollback.
+
+Runtime files are private to the local user. They contain session identifiers, request digests, restoration preferences and cached final answers; they are not suitable for publishing. Normal conversation data also remains in each product's own history. No credentials are copied into this repository.
+
+## Development and verification
+
+```sh
+# Portable tests; fake Claude executable, no subscription usage:
+python3 -m unittest test_adapter -v
+
+# macOS protocol integration with your installed Codex binary.
+# Temporary Codex home and fake inference; no real tasks or model calls:
+CODEX_ADAPTER_INTEGRATION=1 python3 -m unittest test_adapter.ProtocolTests -v
+
+# Explicit live smoke: consumes Claude subscription usage:
+python3 smoke.py
+```
+
+The integration test exercises the real app-server protocol for model-picker preferences, task switching, preserved history, side chats, parallel work, normal shutdown, and crash recovery including archived tasks. Portable tests cover environment isolation, authentication failure, concurrency, cancellation, session continuation and refusal of other models.
+
+Live verification has covered two overlapping Claude sessions, native Read/Write effects in temporary directories, and one native Agent subagent. Main-agent and subagent transcripts identified Opus 5.5. Full desktop UI activation is a separate manual check; the protocol tests alone do not establish UI compatibility across releases.
+
+## Related project
+
+[`jpm8888/claude-codex-proxy`](https://github.com/jpm8888/claude-codex-proxy) takes a different approach: a Responses API proxy with Codex tool/browser/plugin translation. This adapter focuses on per-task desktop routing, native Claude execution and reversible operation. Both use the local Claude CLI; this project does not include code from that repository.
+
+## License
+
+[MIT](LICENSE), covering this adapter's code only.
