@@ -2,7 +2,7 @@
 
 Investigated on September 25, 2026, with macOS desktop build 10954, bundled Codex CLI 0.155.0-alpha.16.4, and local Claude Code 2.1.282.
 
-**Result: the transport is viable; the desktop integration is not yet verified.** A temporary local prototype passed real Claude subscription, native subagent, and browser tests. The installed launcher still uses the existing wrapper. No standalone service, LaunchAgent, provider configuration, or app modification was installed.
+**Result: the transport is viable; standard desktop coordination is restored; standalone Claude coordination is not yet verified.** A temporary local prototype passed real Claude subscription, native subagent, and browser tests. The user then restored and relaunched standard Codex. The optional adapter launcher still uses the existing wrapper and remains separate. No standalone service, LaunchAgent, provider configuration, or app modification was installed.
 
 ## Proposed process and tool flow
 
@@ -23,6 +23,7 @@ The Responses tool-call pattern in [claude-codex-proxy](https://github.com/jpm88
 | Screenshot round trip | The host returned an image block; the MCP relay delivered an image block to Claude, which described its contents. The test tab was closed. |
 | Subscription and permissions | The existing native runtime checked claude.ai subscription authentication, stripped inherited API/provider overrides, pinned the native model, and used `--permission-mode auto`. No API-key client or OpenAI inference fallback was added. |
 | Refusal checks | Seven deterministic local tests passed, including wrong token, unbound task, OpenAI model ID, mismatched attribution, required host model review, namespace handling, and inline image conversion. No inference ran for rejected requests. |
+| Stock desktop coordination after restart | The official desktop directly launched the bundled Codex server, with no Python wrapper between them. Real read and wait calls succeeded for existing tasks. A real message was delivered back to the investigation task itself; other tasks were not resumed. New desktop logs showed the task-tools server ready and no signed-peer rejections. This verifies stock Codex, not the standalone Claude provider. |
 
 The browser test initially timed out with an inherited `CODEX_CLI_PATH` wrapper override. It passed after that override was removed. Its first successful interaction still omitted screenshots because the test catalog declared text-only input; declaring image support fixed image delivery. These are separate findings from desktop task-tool authorization.
 
@@ -30,7 +31,7 @@ Two temporary workspace trust entries written by Codex during the initial tests 
 
 ## What remains unverified
 
-- **Actual read/wait/message access.** The running desktop was still launched through the Python wrapper. The isolated test server was launched by a test harness, so it also does not establish the official desktop ancestry. Task tools were absent. Synthetic function tests cannot establish their availability, actual message delivery, or signed-peer authorization.
+- **Actual read/wait/message access from standalone Claude.** The initial standalone test server was launched by a test harness while the desktop was still wrapped; task tools were absent. After restoring the official desktop process chain, real read/wait/message access passed in the existing native Codex investigation task. The standalone Claude provider has not yet been attached to a desktop-owned task, so the synthetic relay tests and stock recovery do not establish end-to-end Claude coordination.
 - **Provider selection in the stock app.** A catalog entry supplies a model, not its provider. The existing wrapper explicitly changes the provider on task start/resume/fork. A standalone endpoint alone cannot preserve the mixed dropdown's routing. Merely adding an Opus catalog entry while leaving the OpenAI provider selected is unsafe. A supported provider-selection path must be established first.
 - **Automatic approval across both systems.** Claude's native automatic permissions were retained. Host permissions still apply to forwarded tools. The prototype refuses requests requiring host model-based review rather than bypassing that policy or invoking an OpenAI reviewer. It cannot promise that every host action will be automatically approved.
 - **Production task binding and lifecycle.** Tests explicitly bound each task's workspace, model and effort before inference. A deployable service still needs a trustworthy stock-app binding path, side-chat handling, cancellation across disconnected tool continuations, restart recovery, and provider rollback. Those capabilities must not be inferred from user prompt text.
@@ -38,7 +39,7 @@ Two temporary workspace trust entries written by Codex during the initial tests 
 
 ## Next verification boundary
 
-First quit the adapter-launched desktop and run the existing **Restore Standard Codex.command**. Confirm the stock desktop launches its official Codex server directly and that real task tools are available again. Then use a supported custom-provider configuration to test the standalone relay from an actual desktop-owned task, including read, wait, an authorized message, browser images, native subagents and provider/model isolation.
+The stock restart and real coordination baseline are complete. Next establish a supported provider-selection and task-binding path, then test the standalone relay from an actual desktop-owned Claude task, including read, wait, an authorized message, browser images, native subagents and provider/model isolation. Keep the current standard app running until that bounded setup is ready; another restart alone will not solve provider selection.
 
 Keep the working standard setup and current rollback path until those checks pass. Do not patch signature checks, impersonate an OpenAI model, modify the app bundle, or route native Codex/voice traffic through the Claude endpoint to hide a routing problem.
 
