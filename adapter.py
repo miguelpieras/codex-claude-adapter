@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from native import MODEL, PROVIDER, NativeRuntime, atomic_json, digest
 from paths import CODEX, require_codex
+from browser import BrowserBridge
 
 ROOT = Path(__file__).resolve().parent
 HOME = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
@@ -38,13 +39,14 @@ def make_catalog(home, destination):
                 additional_speed_tiers=[], service_tiers=[], context_window=100000,
                 max_context_window=100000, comp_hash=None, input_modalities=['text'],
                 supports_image_detail_original=False, supports_search_tool=False,
-                support_verbosity=False, node_repl_disabled=True, use_responses_lite=False,
+                support_verbosity=False, node_repl_disabled=False, use_responses_lite=False,
                 default_reasoning_level='medium', experimental_supported_tools=[])
     opus.pop('model_messages', None)
     opus.pop('tool_mode', None)
     opus['base_instructions'] = ('You are Claude Opus running through local Claude Code. '
         'Follow developer and user instructions and the provided project guidance. '
-        'Execute using native Claude Code tools. Codex host tool schemas are unavailable. '
+        'Execute using native Claude Code tools and explicitly exposed browser MCP tools. '
+        'Other Codex host tool schemas are unavailable. '
         'Respect permissions, existing changes, and the user\'s requested scope.')
     atomic_json(destination, {'models': [opus, *models]})
 
@@ -113,6 +115,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_POST(self):
+        if self.path == '/mcp/browser' and getattr(self.server, 'browser', None):
+            return self.server.browser.handle(self)
         if not hmac.compare_digest(self.headers.get('X-Local-Claude-Token', ''), self.server.token):
             return self.reject(401, 'Unrecognized local adapter client.')
         if self.path != '/v1/responses':
@@ -134,7 +138,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         stream = Stream(self, MODEL)
         try:
-            final, usage = self.server.native.infer(thread_id, data, stream.message, stream.cancelled)
+            metadata = self.headers.get('x-codex-turn-metadata') or (data.get('client_metadata') or {}).get('x-codex-turn-metadata')
+            final, usage = self.server.native.infer(thread_id, data, stream.message, stream.cancelled,
+                                                   browser_metadata=metadata)
             stream.finish(final, usage)
         except (BrokenPipeError, ConnectionResetError):
             self.server.native.cancel(thread_id)
@@ -144,6 +150,13 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         self.close_connection = True
+
+    def do_GET(self):
+        if self.path == '/mcp/browser' and getattr(self.server, 'browser', None):
+            return self.server.browser.handle(self)
+        self.reject(404, 'Unknown adapter endpoint.')
+
+    do_DELETE = do_GET
 
 
 class RpcError(Exception):
@@ -424,6 +437,7 @@ async def serve(args):
                                                stdout=asyncio.subprocess.PIPE, stderr=sys.stderr,
                                                limit=16_000_000)
     adapter.core = Core(proc, adapter.notification)
+    native.browser = server.browser = BrowserBridge(adapter, asyncio.get_running_loop(), server.server_port)
     tasks = set()
     async def dispatch(message):
         if 'method' not in message or 'id' not in message:

@@ -10,6 +10,7 @@ Experimental, macOS-only, and unofficial. This project is not affiliated with Op
 - Switches idle tasks between native Codex and Opus while retaining saved conversation history.
 - Runs separate Claude sessions for concurrent Opus tasks.
 - Uses Claude Code's native tools and subagents. Subagents are pinned to the same Opus model.
+- Exposes the desktop's configured browser tools to Claude, including page interactions and screenshot results.
 - Makes UI side chats inherit Opus, with read-only tools.
 - Restores saved task providers before returning to stock Codex or removing runtime files.
 
@@ -78,14 +79,26 @@ Normal wrapper shutdown also attempts restoration. **After a crash or forced qui
 
 **Claude Code owns native tool execution and approvals.** It runs in `auto` permission mode, without `--dangerously-skip-permissions`. Requests requiring interactive approval are denied and reported because this adapter does not yet display Claude permission prompts. Its automatic permission classifier may be another Anthropic model; the Opus pin applies to the task and native subagents, not that classifier.
 
-Claude runs in safe mode with strict MCP configuration. Built-in tools and native agents remain available; custom Claude plugins, hooks, commands, MCP servers and configuration extensions are disabled. Codex project instructions are supplied as conversation context. Native tool progress appears as commentary; it is not executed a second time by Codex.
+Claude normally runs in safe mode with strict MCP configuration. When the browser bridge is available, it uses restricted mode instead: user/project/local settings are ignored, hooks and skills are disabled, and the only explicitly configured MCP server is the browser bridge. Native tools and agents remain available through `--tools default`; restricted mode confines file tools to the working directories. Codex project instructions are supplied as conversation context. Native tool progress appears as commentary; it is not executed a second time by Codex.
 
 Codex's OS sandbox and approval reviewer do **not** govern native Claude tools. Read-only tasks and ephemeral side chats restrict native tools to Read/Glob/Grep. Side-chat editing and subagents are currently unavailable. Choose named Codex permission profiles before starting an Opus task; changing profiles mid-task is unsupported.
+
+### Browser access
+
+The bridge discovers the installed **Unified Computer Use** plugin's `cua_repl.js` and `js_reset` tools for the current task. Their documentation and screenshot/image results pass directly to Claude through MCP. Calls use the bundled app-server's `mcpServer/tool/call` API, attributed to the actual Codex task, turn and Opus model. No browser profile or cookies are copied, and no browser debugging connection is opened by the adapter.
+
+Ask Claude to use the **Codex in-app browser**. The embedded browser requires a task attached to the desktop UI. Connected Chrome is also available through the same tools when enabled in Codex. If a browser is unavailable, Claude must report that instead of claiming the work succeeded. The plugin also exposes computer-use APIs; its existing access restrictions still apply.
+
+**Claude's automatic permissions govern requests to this MCP bridge.** Browser-runtime policies remain enforced, but calls do not go through Codex's model-side tool approval loop. The adapter refuses browser access when the host metadata requires OpenAI model-based review; it does not disable that requirement or pretend to be an OpenAI model. Interactive Claude permission prompts remain unsupported.
+
+Each turn receives a separate, short-lived local token. Other tools/servers and caller-supplied task identities cannot be selected through this endpoint. Stop revokes the token; an already-dispatched browser action may still finish and is never automatically retried. Browser tools are unavailable in read-only tasks and side chats. Parallel tasks have separate identities; native subagents within one task share its browser REPL and must coordinate tabs and variable names. Browser contents/screenshots used by Claude are sent to Claude as tool results through the subscription session.
+
+The bridge has no persistent browser service or separate installation. Standard launch and uninstall retain the same restoration behavior.
 
 Other limitations:
 
 - Local interactive text tasks only; no remote-host or scheduled-task integration.
-- Codex app tools, connectors and browser/computer tools are not forwarded to Claude.
+- Other Codex app tools and connectors are not forwarded to Claude.
 - Voice is blocked in Opus tasks because it uses OpenAI. Native Codex tasks retain their native route.
 - General Codex image/audio attachments are not supported. Claude can inspect local files with its own tools.
 - Codex review and compaction commands are not integrated. The advertised Codex context budget is 100k tokens.
@@ -103,6 +116,7 @@ Codex desktop (process-local CLI override)
       └─ Opus task   → task-specific custom provider
                       → authenticated loopback Responses endpoint
                       → local Claude Code session and native tools
+                         └─ browser MCP → bundled app-server → installed browser runtime
 ```
 
 The wrapper adds a temporary model catalog, explicitly selects the provider on task creation/resume/fork, and reloads an idle task when its provider changes. It verifies the selected provider before sending a turn. A local token authenticates the loopback endpoint. Original model/provider choices are retained for rollback.
@@ -113,7 +127,7 @@ Runtime files are private to the local user. They contain session identifiers, r
 
 ```sh
 # Portable tests; fake Claude executable, no subscription usage:
-python3 -m unittest test_adapter -v
+python3 -m unittest discover -v
 
 # macOS protocol integration with your installed Codex binary.
 # Temporary Codex home and fake inference; no real tasks or model calls:
@@ -124,6 +138,10 @@ python3 smoke.py
 ```
 
 The integration test exercises the real app-server protocol for model-picker preferences, task switching, preserved history, side chats, parallel work, normal shutdown, and crash recovery including archived tasks. Portable tests cover environment isolation, authentication failure, concurrency, cancellation, session continuation and refusal of other models.
+
+Browser transport tests cover task/turn attribution, token isolation and revocation, read-only restrictions, image results, host denials and rejection of calls requiring OpenAI review. Full in-app-browser verification requires an adapter-launched desktop task; isolated app-server tasks do not have an embedded browser panel.
+
+A live subscription-backed Opus session has successfully used Codex's browser tools to open a temporary local page in Chrome, click a button, read a generated value, receive a screenshot and close its test tab. Embedded-panel behavior and browser use by native subagents remain unverified.
 
 Live verification has covered two overlapping Claude sessions, native Read/Write effects in temporary directories, and one native Agent subagent. Main-agent and subagent transcripts identified Opus 5.5. Full desktop UI activation is a separate manual check; the protocol tests alone do not establish UI compatibility across releases.
 
