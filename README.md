@@ -44,6 +44,10 @@ Choose **Claude Opus 5.5 · Claude Code** in the dropdown. The `Start Codex with
 
 The launcher passes `CODEX_CLI_PATH` to that app process only. Normal Codex launches do not inherit it. Opus default preferences are stored separately from normal Codex settings.
 
+For a one-click Dock icon, run `python3 dock.py install`. This creates **Codex with Opus.app** in this checkout and pins it without opening or stopping Codex. Click it after fully quitting standard Codex. If this adapter is already running, the icon brings Codex forward. If standard Codex is running, it asks you to quit after your tasks finish. Keep the checkout in place while using the icon.
+
+Remove just the shortcut with `python3 dock.py remove`. Full adapter uninstall also removes this app and its Dock entry. Your original Codex application and Dock icon are retained.
+
 Application discovery checks `/Applications` and `~/Applications` for `Codex.app` or a Codex distribution named `ChatGPT.app`, verifying the Codex bundle identifier. The ordinary ChatGPT app is not supported. Optional overrides:
 
 ```sh

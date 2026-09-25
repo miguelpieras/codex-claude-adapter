@@ -105,6 +105,8 @@ def rollback(*, remove=False):
             unknown = {p.name for p in RUNTIME.iterdir()} - known
             if unknown or RUNTIME.is_symlink():
                 raise RuntimeError('Unexpected runtime files or a symlink; task restoration succeeded, but automatic deletion was stopped.')
+            from dock import remove as remove_launcher
+            remove_launcher(root=ROOT)
             shutil.rmtree(RUNTIME)
     print('Native provider restored for ' + str(len(restored)) + ' saved task(s). Global Codex settings and app bundle are unchanged.')
     if remove:
