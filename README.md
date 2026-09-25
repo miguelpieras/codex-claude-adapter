@@ -6,6 +6,8 @@ Experimental, macOS-only, and unofficial. This project is not affiliated with Op
 
 **Known desktop limitation:** on the tested macOS desktop build, launching through this Python wrapper prevents the built-in `codex_app` MCP server from passing the desktop's code-signing checks. Task coordination tools such as read, wait and message are then unavailable, including in native Codex tasks. Browser helper startup has been repaired and verified separately; that does not establish task-tool availability. Use the standard launcher below when task coordination is required. The adapter does not bypass the desktop's signature checks.
 
+[Standalone service investigation](STANDALONE.md): an isolated Responses/MCP prototype passed live browser interaction, screenshot delivery, and native Opus subagent checks. Real desktop task coordination remains unverified. The prototype is not installed by these launchers and is not a confirmed replacement for the wrapper.
+
 ## What it does
 
 - Adds **Claude Opus 5.5 · Claude Code** and **Claude Fable 5.1 · Claude Code** to the model picker during an opt-in launch.
