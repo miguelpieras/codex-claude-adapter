@@ -46,6 +46,8 @@ The launcher passes `CODEX_CLI_PATH` to that app process only. Normal Codex laun
 
 For a one-click Dock icon, run `python3 dock.py install`. This creates **Codex with Opus.app** in this checkout and pins it without opening or stopping Codex. Click it after fully quitting standard Codex. If this adapter is already running, the icon brings Codex forward. If standard Codex is running, it asks you to quit after your tasks finish. Keep the checkout in place while using the icon.
 
+Choose your own icon with `python3 dock.py install --icon /path/to/icon.icns`. Rebuilding the launcher preserves its selected icon.
+
 Remove just the shortcut with `python3 dock.py remove`. Full adapter uninstall also removes this app and its Dock entry. Your original Codex application and Dock icon are retained.
 
 Application discovery checks `/Applications` and `~/Applications` for `Codex.app` or a Codex distribution named `ChatGPT.app`, verifying the Codex bundle identifier. The ordinary ChatGPT app is not supported. Optional overrides:
@@ -78,6 +80,14 @@ Restoration uses the bundled app-server's task APIs, including for archived task
 After successful uninstall, delete this source checkout if you no longer want it. The command deliberately does not delete source code, Git history, or sibling folders. Your Codex conversations, ordinary Claude Code transcripts, Claude installation and login are retained.
 
 Normal wrapper shutdown also attempts restoration. **After a crash or forced quit, run `python3 manage.py standard` before opening stock Codex.** Do not delete the checkout or runtime directory first: saved tasks may still require migration.
+
+## Codex app updates
+
+The original Codex app remains unmodified and can use its normal updater. The adapter finds the installed app and its bundled CLI at launch; it does not ship or freeze a separate Codex version.
+
+For the safest update, finish active tasks, quit Codex, then run `python3 manage.py standard` (or **Restore Standard Codex.command**) to restore saved task providers using the currently installed version. Update through the stock app. After the update, quit and use **Codex with Opus** to re-enable the adapter; an updater's automatic restart should not be assumed to preserve the launcher override.
+
+Compatibility with future releases is not guaranteed: the app-server, model catalog and browser interfaces are experimental. A Codex update may require an adapter update before Opus works again. Continue in stock Codex if that happens. Updating Codex does not update this source checkout or its separately installed Claude CLI.
 
 ## Tools, permissions and limits
 

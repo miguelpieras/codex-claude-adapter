@@ -2,6 +2,7 @@
 """Build a local Dock applet. No changes to the installed Codex application."""
 import argparse
 import fcntl
+import hashlib
 import json
 from pathlib import Path
 import plistlib
@@ -47,11 +48,20 @@ def refresh_dock():
         raise RuntimeError('Launcher saved, but the Dock could not be refreshed. Log in again to refresh it.')
 
 
-def install():
+def install(icon=None):
     require_codex()
     path = bundle()
+    icon_bytes = None
     if path.exists() or path.is_symlink():
         verify_owned(path, ROOT)
+        old_info = plistlib.loads((path / 'Contents/Info.plist').read_bytes())
+        old_icon = old_info.get('CFBundleIconFile', '')
+        if old_icon.startswith('launcher-') and Path(old_icon).name == old_icon:
+            icon_bytes = (path / 'Contents/Resources' / old_icon).read_bytes()
+    if icon:
+        icon_bytes = Path(icon).expanduser().read_bytes()
+    if icon_bytes is not None and not icon_bytes.startswith(b'icns'):
+        raise ValueError('Choose a macOS .icns icon. The launcher was left unchanged.')
     command = shlex.join(['/usr/bin/env', 'CODEX_HOME=' + str(HOME),
                          sys.executable, str(ROOT / 'dock.py'), 'launch'])
     script = ('on run\ntry\ndo shell script ' + json.dumps(command, ensure_ascii=False) +
@@ -63,6 +73,10 @@ def install():
     info = plistlib.loads(info_path.read_bytes())
     info.update(CFBundleIdentifier=IDENTIFIER, CFBundleDisplayName=NAME,
                 CFBundleName=NAME, CodexAdapterRoot=str(ROOT), LSUIElement=True)
+    if icon_bytes:
+        icon_name = 'launcher-' + hashlib.sha256(icon_bytes).hexdigest()[:12] + '.icns'
+        (path / 'Contents/Resources' / icon_name).write_bytes(icon_bytes)
+        info['CFBundleIconFile'] = icon_name
     info_path.write_bytes(plistlib.dumps(info))
     subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(path)],
                    check=True, capture_output=True)
@@ -71,7 +85,7 @@ def install():
                 'file-data': {'_CFURLString': path.as_uri(), '_CFURLStringType': 15}}}
         subprocess.run(['/usr/bin/defaults', 'write', 'com.apple.dock', 'persistent-apps',
                         '-array-add', plistlib.dumps(tile).decode()], check=True, capture_output=True)
-        refresh_dock()
+    refresh_dock()
     if not any(is_our_tile(e, path) for e in dock_entries()):
         raise RuntimeError('The app was built, but its Dock entry could not be verified.')
     print('Prepared and pinned: ' + str(path))
@@ -117,9 +131,15 @@ def launch():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['install', 'launch', 'remove'])
+    parser.add_argument('--icon', help='Optional .icns icon for install; later installs preserve it.')
     args = parser.parse_args()
     try:
-        globals()[args.action]()
+        if args.icon and args.action != 'install':
+            parser.error('--icon is only supported with install')
+        if args.action == 'install':
+            install(args.icon)
+        else:
+            globals()[args.action]()
     except Exception as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
