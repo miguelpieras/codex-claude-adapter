@@ -4,6 +4,8 @@ Run **Claude Opus 5.5 and Fable 5.1 through your local Claude Code login** in th
 
 Experimental, macOS-only, and unofficial. This project is not affiliated with OpenAI or Anthropic. It contains adapter code only; neither product's binaries, credentials, model catalog, nor proprietary prompts are distributed. Their respective access requirements and terms still apply.
 
+**Known desktop limitation:** on the tested macOS desktop build, launching through this Python wrapper prevents the built-in `codex_app` MCP server from passing the desktop's code-signing checks. Task coordination tools such as read, wait and message are then unavailable, including in native Codex tasks. Browser helper startup has been repaired and verified separately; that does not establish task-tool availability. Use the standard launcher below when task coordination is required. The adapter does not bypass the desktop's signature checks.
+
 ## What it does
 
 - Adds **Claude Opus 5.5 · Claude Code** and **Claude Fable 5.1 · Claude Code** to the model picker during an opt-in launch.
@@ -152,7 +154,7 @@ Codex desktop (process-local CLI override)
                          └─ browser MCP → bundled app-server → installed browser runtime
 ```
 
-Desktop auxiliary servers and proxy/daemon/schema commands pass directly to the bundled CLI; they do not take the adapter ownership lock. This keeps native browser and task-coordination helpers working during an adapter launch. The wrapper adds a temporary model catalog, explicitly selects the provider on task creation/resume/fork, and reloads an idle task when its provider changes. It verifies the selected provider before sending a turn. A local token authenticates the loopback endpoint. Original model/provider choices are retained for rollback.
+Desktop auxiliary servers and proxy/daemon/schema commands pass directly to the bundled CLI; they do not take the adapter ownership lock. This repairs browser helper startup. The separate desktop task-tools MCP server remains affected by the code-signing limitation above. The wrapper adds a temporary model catalog, explicitly selects the provider on task creation/resume/fork, and reloads an idle task when its provider changes. It verifies the selected provider before sending a turn. A local token authenticates the loopback endpoint. Original model/provider choices are retained for rollback.
 
 Runtime files are private to the local user. They contain session identifiers, request digests, restoration preferences and cached final answers; they are not suitable for publishing. Normal conversation data also remains in each product's own history. No credentials are copied into this repository.
 
@@ -171,6 +173,8 @@ python3 smoke.py
 ```
 
 The integration test exercises the real app-server protocol for model-picker preferences, Opus/Fable switching, all advertised effort choices, preserved history, side chats, parallel work, concurrent native helper startup, normal shutdown, and crash recovery including archived tasks. Portable tests cover environment isolation, authentication failure, concurrency, cancellation, session continuation and refusal of other models.
+
+The auxiliary-server test checks ordinary app-server RPC with an isolated configuration. It does not test the desktop's `codex_app` MCP transport or its signed-process authorization. That desktop transport currently fails with `missing-code-signing-identity` / `Codex app tools pipe closed` under the wrapper.
 
 Browser transport tests cover task/turn attribution, token isolation and revocation, read-only restrictions, image results, host denials and rejection of calls requiring OpenAI review. Full in-app-browser verification requires an adapter-launched desktop task; isolated app-server tasks do not have an embedded browser panel.
 
