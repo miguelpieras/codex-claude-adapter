@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import shlex
@@ -80,9 +81,27 @@ def install(icon=None):
     info_path.write_bytes(plistlib.dumps(info))
     subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(path)],
                    check=True, capture_output=True)
-    if not any(is_our_tile(e, path) for e in dock_entries()):
-        tile = {'tile-type': 'file-tile', 'tile-data': {'file-label': NAME,
-                'file-data': {'_CFURLString': path.as_uri(), '_CFURLStringType': 15}}}
+    # Recompiling an existing applet changes its contents without necessarily
+    # changing the bundle's mtime. Refresh this bundle's Launch Services entry
+    # so Dock/Icon Services do not keep the original generic AppleScript icon.
+    os.utime(path, None)
+    subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/'
+                    'LaunchServices.framework/Support/lsregister', '-f', str(path)],
+                   check=True, capture_output=True)
+    tile = {'tile-type': 'file-tile', 'tile-data': {'file-label': NAME,
+            'file-data': {'_CFURLString': path.as_uri(), '_CFURLStringType': 15}}}
+    entries = dock_entries()
+    if any(is_our_tile(e, path) for e in entries):
+        # Dock caches an icon against its tile/bookmark even after Launch
+        # Services resolves the new icon. Give only this entry a fresh identity,
+        # retaining its position and all unrelated entries verbatim.
+        updated = [tile if is_our_tile(e, path) else e for e in entries]
+        if dock_entries() != entries:
+            raise RuntimeError('Dock changed concurrently; retry installation.')
+        subprocess.run(['/usr/bin/defaults', 'write', 'com.apple.dock', 'persistent-apps',
+                        '-array', *[plistlib.dumps(e).decode() for e in updated]],
+                       check=True, capture_output=True)
+    else:
         subprocess.run(['/usr/bin/defaults', 'write', 'com.apple.dock', 'persistent-apps',
                         '-array-add', plistlib.dumps(tile).decode()], check=True, capture_output=True)
     refresh_dock()
