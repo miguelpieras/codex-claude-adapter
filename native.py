@@ -1,5 +1,6 @@
 """Claude Code subscription runtime. No OpenAI or Anthropic API client."""
 import hashlib
+import base64
 import json
 import os
 from pathlib import Path
@@ -97,8 +98,37 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def inline_image_message(payload):
+    """Frame existing inline images for Claude Code without fetching URLs."""
+    images = []
+    def convert(value):
+        if isinstance(value, dict):
+            if value.get('type') in ('input_audio', 'input_file'):
+                raise ValueError('Audio and file attachments are not supported by this adapter.')
+            if value.get('type') == 'input_image':
+                url = value.get('image_url', '')
+                if not isinstance(url, str) or ';base64,' not in url:
+                    raise ValueError('Only inline image attachments are supported; remote URLs are not fetched.')
+                header, encoded = url.split(';base64,', 1)
+                mime = header.removeprefix('data:')
+                if not header.startswith('data:') or mime not in ('image/png', 'image/jpeg', 'image/gif', 'image/webp'):
+                    raise ValueError('Unsupported inline image format.')
+                if len(images) >= 20 or len(encoded) > 8_000_000:
+                    raise ValueError('Too many or oversized inline images.')
+                base64.b64decode(encoded, validate=True)
+                images.append({'type': 'image', 'source': {'type': 'base64', 'media_type': mime, 'data': encoded}})
+                return {'type': 'attached_image', 'number': len(images)}
+            return {k: convert(v) for k, v in value.items()}
+        return [convert(v) for v in value] if isinstance(value, list) else value
+    cleaned = convert(payload)
+    content = [{'type': 'text', 'text': json.dumps(cleaned)}]
+    for index, img in enumerate(images, 1):
+        content.extend([{'type': 'text', 'text': 'Context image ' + str(index)}, img])
+    return {'type': 'user', 'message': {'role': 'user', 'content': content}}
+
+
 class NativeRuntime:
-    def __init__(self, directory):
+    def __init__(self, directory, *, system=SYSTEM, inline_images=False):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.guard = threading.RLock()
@@ -106,6 +136,8 @@ class NativeRuntime:
         self.running = {}
         self.bindings = {}
         self.browser = None
+        self.system = system
+        self.inline_images = inline_images
 
     def bind(self, thread_id, cwd, *, readonly=False, model=MODEL, effort=None):
         uuid.UUID(thread_id)
@@ -131,7 +163,8 @@ class NativeRuntime:
     def infer(self, thread_id, request, emit, cancelled, *, browser_metadata=None):
         model = request.get('model')
         effort = claude_effort(model, (request.get('reasoning') or {}).get('effort'))
-        if has_media(request.get('input')):
+        media = has_media(request.get('input'))
+        if media and not self.inline_images:
             raise ValueError('This adapter currently accepts text; ask Claude to read local files using its native tools.')
         if request.get('previous_response_id'):
             raise ValueError('Full task context is required.')
@@ -174,6 +207,7 @@ class NativeRuntime:
             payload = {'instructions': request.get('instructions'),
                        'input': inputs[prefix:] if resume else inputs,
                        'continuation': bool(resume)}
+            framed = inline_image_message(payload) if media else None
             customization = ['--safe-mode']
             if self.browser and not binding['readonly']:
                 try:
@@ -194,9 +228,11 @@ class NativeRuntime:
                    '--permission-mode', 'auto', '--permission-prompts', 'none',
                    '--model', model, '--effort', effort, '--tools',
                    'Read,Glob,Grep' if binding['readonly'] else 'default',
-                   '--append-system-prompt', SYSTEM, '--output-format', 'stream-json',
+                   '--append-system-prompt', self.system, '--output-format', 'stream-json',
                    '--verbose', '--forward-subagent-text', '-p']
             cmd += ['--resume' if resume else '--session-id', session_id]
+            if framed:
+                cmd += ['--input-format', 'stream-json']
             state = {'session_id': session_id, 'cwd': binding['cwd'], 'request': key,
                      'model': model, 'effort': effort, 'status': 'running', 'input_count': len(inputs), 'input_digest': digest(inputs)}
             atomic_json(path, state)
@@ -215,7 +251,7 @@ class NativeRuntime:
                 finally:
                     events.put(None)
             threading.Thread(target=read, daemon=True).start()
-            process.stdin.write(json.dumps(payload))
+            process.stdin.write(json.dumps(framed or payload) + ('\n' if framed else ''))
             process.stdin.close()
             result = None
             emit('Claude Code is running ' + MODELS[model][0] + ' at ' + effort + ' with native tools and Claude automatic permissions.')

@@ -1,46 +1,56 @@
-# Standalone service investigation
+# Standalone service verification
 
-Investigated on September 25, 2026, with macOS desktop build 10954, bundled Codex CLI 0.155.0-alpha.16.4, and local Claude Code 2.1.282.
+September 25, 2026: macOS Codex desktop build 10954, bundled Codex CLI 0.155.0-alpha.16.4, Claude Code 2.1.282.
 
-**Result: the transport is viable; standard desktop coordination is restored; standalone Claude coordination is not yet verified.** A temporary local prototype passed real Claude subscription, native subagent, and browser tests. The user then restored and relaunched standard Codex. The optional adapter launcher still uses the existing wrapper and remains separate. No standalone service, LaunchAgent, provider configuration, or app modification was installed.
+**Result: separate Claude desktop mode works with the official process chain. Real Claude task coordination and the in-app browser passed.** Regular Codex stays open with its original provider and tasks. The user accepted separate modes rather than a mixed GPT/Claude provider dropdown.
 
-## Proposed process and tool flow
+## Architecture
 
-Keep the official desktop process launching the official bundled Codex server and its signed helpers directly. Run the adapter as a separate authenticated loopback Responses provider. The service launches the user's authenticated Claude CLI; it never becomes an ancestor of the desktop's Codex server or helpers.
+```text
+Official Codex desktop, separate data directory
+  └─ Official bundled Codex server and signed helpers
+       ├─ Local Responses request → independent Python service → local Claude CLI
+       │                                                        ├─ native tools
+       │                                                        └─ native Agent subagents
+       └─ Normal Responses function call ← relay MCP call from Claude
+          → official host tool and permission checks
+          → next Responses request → waiting native MCP call
+```
 
-For a forwarded host tool, Claude calls an explicitly configured local MCP tool. The service emits a normal Responses function call. Codex executes it through its own tool and permission system, then returns the result in its next Responses request. The service returns that result to the waiting MCP call in the same native Claude process. Claude retains its native tools, automatic permission mode, and native Agent subagents.
+The service is not between the desktop and its core. No app patch, CLI override, signature workaround, raw desktop IPC client, or OpenAI model impersonation is used.
 
-The Responses tool-call pattern in [claude-codex-proxy](https://github.com/jpm8888/claude-codex-proxy) was useful. Its use of `--dangerously-skip-permissions` is unsuitable for this adapter. The investigation used an independently implemented MCP relay and the existing subscription-only native runtime, without copying that permission setting or its structured-output agent loop.
+The app's built-in `CODEX_ELECTRON_USER_DATA_PATH`, `CODEX_HOME`, and `--user-data-dir` paths isolate Claude settings and tasks at `~/.codex-claude`. Merely adding Claude to the stock model catalog does not select its provider; app-server also rejected the CLI's named `--profile` option. A separate home supplies the provider directly.
 
-## What passed
+Task workspace/model/permissions come from authenticated core metadata and the isolated core's read-only task registry. Side chats use the host-provided parent task ID and must keep the parent's model and read-only permissions. Prompt text never supplies trusted task authority.
 
-| Check | Evidence and limit |
+## Verification
+
+| Check | Actual evidence |
 | --- | --- |
-| Responses tool continuation | Real Opus called three synthetic read/wait/message functions, passing a random nonce through their results. These were local fixtures, not real Codex task tools. |
-| Native subagent | One native Agent read a fixture using Read. Parent and child transcripts both recorded only `claude-opus-5-5`. Host subagent tools were not exposed. |
-| Concurrent native sessions | Two independently bound Opus tasks overlapped without sharing their native session. |
-| Browser interaction | Through Codex's normal `cua_repl.js` tool, Opus opened a local fixture in Chrome, clicked a button, and read the random result. |
-| Screenshot round trip | The host returned an image block; the MCP relay delivered an image block to Claude, which described its contents. The test tab was closed. |
-| Subscription and permissions | The existing native runtime checked claude.ai subscription authentication, stripped inherited API/provider overrides, pinned the native model, and used `--permission-mode auto`. No API-key client or OpenAI inference fallback was added. |
-| Refusal checks | Seven deterministic local tests passed, including wrong token, unbound task, OpenAI model ID, mismatched attribution, required host model review, namespace handling, and inline image conversion. No inference ran for rejected requests. |
-| Stock desktop coordination after restart | The official desktop directly launched the bundled Codex server, with no Python wrapper between them. Real read and wait calls succeeded for existing tasks. A real message was delivered back to the investigation task itself; other tasks were not resumed. New desktop logs showed the task-tools server ready and no signed-peer rejections. This verifies stock Codex, not the standalone Claude provider. |
+| Official process chain | Regular and isolated desktop instances both directly launched `/Applications/ChatGPT.app/Contents/Resources/codex`. No Python wrapper was between either desktop and its core. |
+| Real task list/read | The user started an Opus desktop task; its actual host tool results listed and read that task successfully. |
+| Real task message | Opus sent `CLAUDE-COORD-OK` to its own task; the host returned the task ID and recorded delivery. No production task was resumed. |
+| Real cross-task wait | The user started Fable 5.1 at Ultra. Its `wait_threads(timeoutMs:0)` returned the Opus task's completed turn, idle status, and no error. The initial self-wait correctly failed because Codex forbids a task waiting on itself. |
+| In-app browser | Opus opened `https://example.com` in `iab`, received the page state with heading `Example Domain`, and closed its own tab. The host then returned an empty tab list. |
+| Native subagent | The Opus task used native `Agent`. Parent and child transcript model fields both contained only `claude-opus-5-5`; the child used `SubagentHandback`. |
+| Fable effort | The task registry stored `ultra`; native session state stored `ultracode`. Native transcript model fields contained only `claude-fable-5-1`. |
+| Concurrent sessions | Earlier subscription-backed standalone probes overlapped two Opus sessions. The final protocol test overlaps two independent tasks using fixture inference and verifies distinct selected models. The two desktop smoke tasks were sequential. |
+| Side chats | The real bundled core's ephemeral, read-only fork with explicit Fable selection passed fixture inference. Native tools were restricted to Read/Glob/Grep. A parent/model mismatch is refused. Interactive side-chat UI behavior was not separately live-tested. |
+| Browser images | The earlier live standalone Chrome probe clicked a local fixture and returned a screenshot image to Claude. Final transport tests preserve inline host images and frame them correctly for later native turns. The final in-app-browser smoke checked page content, not a screenshot. |
+| No model fallback | Rejection tests prevent OpenAI/unknown models, attribution mismatches, unauthorized tokens, required host model reviewers, and messages to unverified/differently modeled tasks from invoking inference. Live native transcripts recorded the selected Claude models. No API-key client is present. |
+| Retry/cancellation | Tests verify exact host call IDs, image continuations, final-result replay without repeated native work, cancellation on wrong results, and rejection of duplicate HTTP requests without cancelling the original turn. |
+| Removal | Tests refuse unrelated directories and running Claude windows, retain history by default, and delete only the marked isolated directory when `--delete-history` is explicit. |
 
-The browser test initially timed out with an inherited `CODEX_CLI_PATH` wrapper override. It passed after that override was removed. Its first successful interaction still omitted screenshots because the test catalog declared text-only input; declaring image support fixed image delivery. These are separate findings from desktop task-tool authorization.
+The initial isolated launch used a deeply nested workspace path, exceeding macOS's UNIX socket limit. It had no tasks, was closed, and was replaced with the shorter home above. The launcher now rejects overly long paths before creating state. The replacement socket initialized successfully and the real coordination tests then passed.
 
-Two temporary workspace trust entries written by Codex during the initial tests were removed, preserving other configuration values. The final browser test used an existing trusted workspace and left the global configuration byte-for-byte unchanged. Test HTTP servers and their native processes were stopped. Normal model/provider settings and the installed rollback launcher were retained.
+## Boundaries
 
-## What remains unverified
+- Claude mode sees its own task history. It does not automatically coordinate regular Codex tasks in another desktop profile.
+- Native automatic permission classification is owned by Claude and can use a different Anthropic model. Selected-model pinning covers task/subagent inference.
+- Forwarded browser/task calls retain host permissions. The adapter refuses host model-based review requirements; it does not promise every host action will auto-approve.
+- Only browser and list/read/wait/message tools are forwarded. Native Claude Agent handles subagents; Codex's host subagent tools are not forwarded.
+- Voice is unavailable in Claude mode; regular Codex retains voice. No claim is made that every background feature of the desktop is intercepted by this provider.
+- An already-dispatched host action can finish after cancellation. Pending host continuations expire after 120 seconds. Interrupted native requests require a new user message rather than automatic replay.
+- No edits were made to the official app bundle, signatures, standard Codex configuration, or standard task providers for this standalone setup.
 
-- **Actual read/wait/message access from standalone Claude.** The initial standalone test server was launched by a test harness while the desktop was still wrapped; task tools were absent. After restoring the official desktop process chain, real read/wait/message access passed in the existing native Codex investigation task. The standalone Claude provider has not yet been attached to a desktop-owned task, so the synthetic relay tests and stock recovery do not establish end-to-end Claude coordination.
-- **Provider selection in the stock app.** A catalog entry supplies a model, not its provider. The existing wrapper explicitly changes the provider on task start/resume/fork. A standalone endpoint alone cannot preserve the mixed dropdown's routing. Merely adding an Opus catalog entry while leaving the OpenAI provider selected is unsafe. A supported provider-selection path must be established first.
-- **Automatic approval across both systems.** Claude's native automatic permissions were retained. Host permissions still apply to forwarded tools. The prototype refuses requests requiring host model-based review rather than bypassing that policy or invoking an OpenAI reviewer. It cannot promise that every host action will be automatically approved.
-- **Production task binding and lifecycle.** Tests explicitly bound each task's workspace, model and effort before inference. A deployable service still needs a trustworthy stock-app binding path, side-chat handling, cancellation across disconnected tool continuations, restart recovery, and provider rollback. Those capabilities must not be inferred from user prompt text.
-- **Fable, effort switching and side chats on this new transport.** The existing wrapper's checks do not establish these behaviors for the standalone design. Only Opus at Low was used in these bounded live probes.
-
-## Next verification boundary
-
-The stock restart and real coordination baseline are complete. Next establish a supported provider-selection and task-binding path, then test the standalone relay from an actual desktop-owned Claude task, including read, wait, an authorized message, browser images, native subagents and provider/model isolation. Keep the current standard app running until that bounded setup is ready; another restart alone will not solve provider selection.
-
-Keep the working standard setup and current rollback path until those checks pass. Do not patch signature checks, impersonate an OpenAI model, modify the app bundle, or route native Codex/voice traffic through the Claude endpoint to hide a routing problem.
-
-Official configuration references: [custom providers and model catalogs](https://learn.chatgpt.com/docs/config-file/config-reference), [CLI configuration profiles](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles). CLI profile support by itself does not prove equivalent desktop profile selection.
+Official reference: [custom provider and model-catalog configuration](https://learn.chatgpt.com/docs/config-file/config-reference). Local app/CLI behavior, rather than CLI profile documentation alone, established the actual desktop launch path.

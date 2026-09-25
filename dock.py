@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Build a local Dock applet. No changes to the installed Codex application."""
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -12,7 +11,7 @@ import shutil
 import subprocess
 import sys
 
-from adapter import HOME, ROOT, RUNTIME
+from adapter import HOME, ROOT
 from paths import APP, require_codex
 
 NAME = 'Codex with Opus'
@@ -130,21 +129,8 @@ def remove(root=ROOT):
 
 
 def launch():
-    import manage
-    if manage.app_running():
-        lock = RUNTIME / 'owner.lock'
-        if lock.exists():
-            with lock.open('r') as handle:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    # This checkout already owns the live adapter. Activate it
-                    # without restarting, migrating tasks or spawning another app.
-                    subprocess.run(['/usr/bin/open', '-a', str(APP.parents[2])], check=True)
-                    return
-        raise RuntimeError('Codex is already open without this adapter. Let your tasks finish, '
-                           'quit Codex completely, then click Codex with Opus. Nothing was stopped.')
-    manage.launch()
+    from claude_mode import launch as standalone_launch
+    standalone_launch()
 
 
 if __name__ == '__main__':
