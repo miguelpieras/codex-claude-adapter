@@ -8,7 +8,7 @@ import copy
 import json
 import secrets
 import threading
-from native import MODEL
+from native import MODEL, MODELS
 
 
 class BrowserBridge:
@@ -26,7 +26,7 @@ class BrowserBridge:
             future.cancel()
             raise
 
-    def open(self, thread_id, metadata):
+    def open(self, thread_id, metadata, *, model=MODEL):
         """Called off the app-server event loop, once per native Claude turn."""
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
@@ -41,11 +41,11 @@ class BrowserBridge:
             return None
         if metadata.get('thread_id', metadata.get('session_id')) != thread_id or metadata.get('turn_id') != session['turn']:
             raise ValueError('Browser metadata does not match the active Codex task and turn.')
-        if not isinstance(metadata.get('session_id'), str) or metadata.get('model', MODEL) != MODEL:
+        if not isinstance(metadata.get('session_id'), str) or model not in MODELS or metadata.get('model', model) != model:
             raise ValueError('Browser attribution is incomplete or references another model.')
         # Preserve core policy fields. Supply the actual model where older core
         # versions omit it; never impersonate an OpenAI model for browser checks.
-        session['metadata'] = {**copy.deepcopy(metadata), 'model': MODEL}
+        session['metadata'] = {**copy.deepcopy(metadata), 'model': model}
         token = secrets.token_urlsafe(32)
         with self.guard:
             self.sessions[token] = session

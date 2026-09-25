@@ -29,10 +29,10 @@ if 'auth' in sys.argv:
 request=json.loads(sys.stdin.read())
 if Path('deny-auth').exists():
  print(json.dumps({'type':'result','is_error':True,'result':'OAuth access token has been revoked'}));sys.exit(1)
-with Path('calls.jsonl').open('a') as f:f.write(json.dumps({'args':sys.argv,'envkeys':[k for k in os.environ if k.startswith(('ANTHROPIC_','OPENAI_','CLAUDE_'))],'request':request})+'\\n')
+with Path('calls.jsonl').open('a') as f:f.write(json.dumps({'args':sys.argv,'envkeys':[k for k in os.environ if k.startswith(('ANTHROPIC_','OPENAI_','CLAUDE_'))],'subagent_model':os.environ.get('CLAUDE_CODE_SUBAGENT_MODEL'),'request':request})+'\\n')
 if 'SLOW' in json.dumps(request):time.sleep(1)
 print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','name':'Read','id':'tool_1','input':{'file_path':'fixture.txt'}}]}}),flush=True)
-print(json.dumps({'type':'result','is_error':False,'result':'CLAUDE_FIXTURE history='+str('HISTORY_123' in json.dumps(request)), 'modelUsage':{'claude-opus-5-5':{}},'usage':{'input_tokens':10,'output_tokens':10},'permission_denials':[]}))
+print(json.dumps({'type':'result','is_error':False,'result':'CLAUDE_FIXTURE history='+str('HISTORY_123' in json.dumps(request)), 'modelUsage':{sys.argv[sys.argv.index('--model')+1]:{}},'usage':{'input_tokens':10,'output_tokens':10},'permission_denials':[]}))
 '''
 
 
@@ -124,6 +124,33 @@ class NativeTests(unittest.TestCase):
         self.assertIn('--resume', calls[1]['args'])
         self.assertTrue(calls[1]['request']['continuation'])
 
+    def test_effort_selection_and_model_transition(self):
+        request = self.request('first')
+        self.run_turn(self.thread, request)
+        request['model'] = native.FABLE
+        self.runtime.bind(self.thread, self.root, model=native.FABLE)
+        for effort in ('xhigh', 'max', 'ultra'):
+            request['reasoning'] = {'effort': effort}
+            self.run_turn(self.thread, request)
+        calls = [json.loads(line) for line in (self.root / 'calls.jsonl').read_text().splitlines()]
+        self.assertEqual(len(calls), 4)
+        for call, expected in zip(calls[1:], ('xhigh', 'max', 'ultracode')):
+            self.assertEqual(call['args'][call['args'].index('--effort') + 1], expected)
+            self.assertEqual(call['subagent_model'], native.FABLE)
+            self.assertIn('--session-id', call['args'])
+        self.run_turn(self.thread, request)
+        self.assertEqual(len((self.root / 'calls.jsonl').read_text().splitlines()), 4)
+        request['input'].append({'role': 'user', 'content': 'new message'})
+        self.run_turn(self.thread, request)
+        self.assertIn('--resume', json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])['args'])
+
+    def test_unknown_effort_rejected_before_launch(self):
+        for effort in ('extra', 'typo', 'ultracode'):
+            req = {**self.request(), 'reasoning': {'effort': effort}}
+            with self.assertRaisesRegex(ValueError, 'Unsupported Claude effort'):
+                self.run_turn(self.thread, req)
+        self.assertFalse((self.root / 'calls.jsonl').exists())
+
     def test_cancellation_blocks_replay(self):
         with ThreadPoolExecutor(1) as pool:
             future = pool.submit(self.run_turn, self.thread, self.request('SLOW'))
@@ -205,7 +232,7 @@ class Endpoint(BaseHTTPRequestHandler):
     def do_POST(self):
         data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         self.server.requests.append(data['model'])
-        if data['model'] == native.MODEL:
+        if data['model'] in native.MODELS:
             self.send_error(400, 'Opus leaked to native provider')
             return
         self.send_response(200)
@@ -227,7 +254,7 @@ class ProtocolTests(unittest.TestCase):
                 home = Path(temp)
                 workspace = home / 'workspace'
                 workspace.mkdir()
-                runtime = home / 'adapter'
+                runtime = home / 'claude-adapter'
                 cli = fake_cli(home)
                 source = Path.home() / '.codex/models_cache.json'
                 (home / 'models_cache.json').write_text(source.read_text())
@@ -235,7 +262,8 @@ class ProtocolTests(unittest.TestCase):
                     'approval_policy="never"\nsandbox_mode="read-only"\nweb_search="disabled"\n'
                     '[analytics]\nenabled=false\n[model_providers.fixture_native]\nname="Fixture"\n'
                     'base_url="http://127.0.0.1:' + str(server.server_port) + '/v1"\n'
-                    'wire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n')
+                    'wire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n'
+                    '[projects.' + json.dumps(str(workspace)) + ']\ntrust_level="trusted"\n')
                 (home / 'config.toml').write_text(config)
                 env = {k: v for k, v in os.environ.items() if not k.startswith(('OPENAI_', 'ANTHROPIC_', 'CLAUDE_', 'CODEX_'))}
                 env['CODEX_HOME'] = str(home)
@@ -248,7 +276,10 @@ class ProtocolTests(unittest.TestCase):
                 client = Client([sys.executable, '-c', code], env)
                 try:
                     models = client.call('model/list', {})
-                    self.assertIn(native.MODEL, [m['model'] for m in models['data']])
+                    self.assertTrue(set(native.MODELS) <= {m['model'] for m in models['data']})
+                    for m in models['data']:
+                        if m['model'] in native.MODELS:
+                            self.assertEqual([e['reasoningEffort'] for e in m['supportedReasoningEfforts']], list(native.EFFORTS))
                     client.call('config/batchWrite', {'edits': [
                         {'keyPath': 'model', 'value': native.MODEL, 'mergeStrategy': 'replace'},
                         {'keyPath': 'model_reasoning_effort', 'value': 'high', 'mergeStrategy': 'replace'}]})
@@ -258,22 +289,37 @@ class ProtocolTests(unittest.TestCase):
                     start = client.call('thread/start', {'cwd': str(workspace), 'model': 'gpt-6-astra'})
                     tid = start['thread']['id']
                     client.turn(tid, 'HISTORY_123')
+                    owner = (runtime / 'owner.lock').read_text()
+                    helper = Client([sys.executable, str(adapter.ROOT / 'adapter.py'),
+                                     'app-server', '--listen', 'stdio://'], env)
+                    try:
+                        self.assertEqual(helper.call('thread/read', {'threadId': tid, 'includeTurns': False})['thread']['id'], tid)
+                        self.assertFalse(set(native.MODELS) & {m['model'] for m in helper.call('model/list', {})['data']})
+                        self.assertEqual((runtime / 'owner.lock').read_text(), owner)
+                    finally:
+                        helper.close()
                     client.call('thread/settings/update', {'threadId': tid, 'model': native.MODEL})
                     client.turn(tid, 'Continue as Opus.')
                     after = client.call('thread/read', {'threadId': tid, 'includeTurns': True})
                     self.assertEqual(after['thread']['modelProvider'], native.PROVIDER)
                     self.assertIn('history=True', json.dumps(after))
+                    client.turn(tid, 'Continue as Fable at Max.', model=native.FABLE, effort='max')
                     fork = client.call('thread/fork', {'threadId': tid, 'ephemeral': True, 'excludeTurns': True})
-                    self.assertEqual(fork['model'], native.MODEL)
+                    self.assertEqual(fork['model'], native.FABLE)
                     self.assertEqual(fork['modelProvider'], native.PROVIDER)
-                    other = client.call('thread/start', {'cwd': str(workspace), 'model': native.MODEL})
+                    other = client.call('thread/start', {'cwd': str(workspace), 'model': native.MODEL, 'sandbox': 'workspace-write'})
                     started = time.monotonic()
                     a = client.start_turn(tid, 'SLOW first')
-                    b = client.start_turn(other['thread']['id'], 'SLOW second')
+                    b = client.start_turn(other['thread']['id'], 'SLOW second', effort='ultra')
                     self.assertEqual(client.completed(a)['status'], 'completed')
                     self.assertEqual(client.completed(b)['status'], 'completed')
                     self.assertLess(time.monotonic() - started, 2.5)
-                    client.turn(fork['thread']['id'], 'Side chat')
+                    client.turn(fork['thread']['id'], 'Side chat', effort='xhigh')
+                    calls = [json.loads(line) for line in (workspace / 'calls.jsonl').read_text().splitlines()]
+                    self.assertTrue(any('ultracode' in call['args'] for call in calls))
+                    self.assertTrue(any(native.FABLE in call['args'] and 'max' in call['args'] for call in calls))
+                    for call in calls:
+                        self.assertEqual(call['subagent_model'], call['args'][call['args'].index('--model') + 1])
                     with self.assertRaisesRegex(RuntimeError, 'Voice uses OpenAI'):
                         client.call('thread/realtime/start', {'threadId': tid})
                     client.turn(tid, 'Return to native', model='gpt-6-astra')
@@ -289,7 +335,7 @@ class ProtocolTests(unittest.TestCase):
                 crashed = Client([sys.executable, '-c', code], env)
                 saved = crashed.call('thread/start', {'cwd': str(workspace), 'model': native.MODEL})
                 crashed.turn(saved['thread']['id'], 'HISTORY_123 crash recovery')
-                archived = crashed.call('thread/start', {'cwd': str(workspace), 'model': native.MODEL})
+                archived = crashed.call('thread/start', {'cwd': str(workspace), 'model': native.FABLE})
                 crashed.turn(archived['thread']['id'], 'HISTORY_123 archived')
                 crashed.call('thread/archive', {'threadId': archived['thread']['id']})
                 crashed.process.kill()

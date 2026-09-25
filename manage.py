@@ -13,7 +13,7 @@ import sys
 import tomllib
 
 from adapter import CODEX, HOME, ROOT, RUNTIME, Core
-from native import MODEL, PROVIDER, atomic_json, check_auth
+from native import MODEL, MODELS, PROVIDER, atomic_json, check_auth
 from paths import APP, require_codex
 
 
@@ -43,7 +43,7 @@ async def migrate(home=HOME, runtime=RUNTIME):
     originals = json.loads(path.read_text()) if path.exists() else {}
     cfg = tomllib.loads((home / 'config.toml').read_text()) if (home / 'config.toml').exists() else {}
     fallback = cfg.get('model', 'gpt-6-astra')
-    if fallback == MODEL:
+    if fallback in MODELS:
         fallback = 'gpt-6-astra'
     rows = candidates(home)
     env = dict(os.environ, CODEX_HOME=str(home))

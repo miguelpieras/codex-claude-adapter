@@ -102,6 +102,16 @@ class BrowserTests(unittest.TestCase):
         error.exception.close()
         self.assertEqual(len(self.request('tools/list', token=token2)['tools']), 1)
 
+    def test_fable_attribution_is_preserved(self):
+        model = 'claude-fable-5-1'
+        metadata = {**self.metadata, 'model': model}
+        with self.assertRaises(ValueError):
+            self.bridge.open('one', metadata)
+        token, _ = self.bridge.open('one', metadata, model=model)
+        self.core.call.return_value = {'content': [{'type': 'text', 'text': 'ok'}]}
+        self.request('tools/call', {'name': 'js', 'arguments': {'code': '1'}}, token=token)
+        self.assertEqual(self.core.call.call_args.args[1]['_meta']['x-codex-turn-metadata']['model'], model)
+
     def test_missing_or_mismatched_attribution_never_uses_browser(self):
         self.assertIsNone(self.bridge.open('one', None))
         self.assertIsNone(self.bridge.open('one', {**self.metadata, 'auto_review_enabled': True}))
