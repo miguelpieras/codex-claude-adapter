@@ -80,7 +80,7 @@ class ConversionTests(unittest.TestCase):
     def test_long_socket_path_rejected_before_creation(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / ('x' * 105)
-            with self.assertRaisesRegex(RuntimeError, 'too long'):
+            with patch.object(claude_mode, 'require_codex'), self.assertRaisesRegex(RuntimeError, 'too long'):
                 claude_mode.prepare(directory)
             self.assertFalse(directory.exists())
 
