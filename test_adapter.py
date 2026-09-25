@@ -43,6 +43,22 @@ def fake_cli(directory):
     return path
 
 
+class DispatchTests(unittest.TestCase):
+    def test_helpers_do_not_take_adapter_ownership(self):
+        for args in (['app-server', '--listen', 'stdio://'],
+                     ['app-server', 'proxy'], ['app-server', 'daemon', 'status'],
+                     ['app-server', '-c', 'features.example=true', 'proxy'],
+                     ['app-server', 'generate-ts'], ['app-server', '--help'],
+                     ['sandbox', '--', 'node']):
+            with self.subTest(args=args):
+                self.assertFalse(adapter.wraps_server(args))
+        for args in (['app-server'], ['app-server', '--stdio'],
+                     ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled'],
+                     ['app-server', '-c', 'model="proxy"', '--listen', 'stdio://']):
+            with self.subTest(args=args):
+                self.assertTrue(adapter.wraps_server(args))
+
+
 class NativeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

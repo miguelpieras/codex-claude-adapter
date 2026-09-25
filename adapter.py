@@ -410,8 +410,10 @@ async def serve(args):
     RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
     # An exclusive OS lock prevents two desktop wrappers owning the same sessions.
     import fcntl
-    lockfile = (RUNTIME / 'owner.lock').open('w')
+    lockfile = (RUNTIME / 'owner.lock').open('a+')
     fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    lockfile.seek(0)
+    lockfile.truncate()
     lockfile.write(str(os.getpid()))
     lockfile.flush()
     native = NativeRuntime(RUNTIME / 'sessions')
@@ -483,8 +485,30 @@ async def serve(args):
         lockfile.close()
 
 
+def wraps_server(args):
+    """Only wrap the server itself, never its proxy/daemon/schema helper commands."""
+    # Desktop browser and app-tools clients spawn this exact auxiliary form.
+    # It must not claim the desktop adapter lock or install a model provider.
+    # The desktop host uses --analytics-default-enabled; explicit adapter
+    # protocol clients use --stdio instead.
+    if args == ['app-server', '--listen', 'stdio://']:
+        return False
+    if 'app-server' not in args or any(v in args for v in ('--help', '-h', '--version')):
+        return False
+    after = iter(args[args.index('app-server') + 1:])
+    values = {'-c', '--config', '--enable', '--disable', '--listen', '--code-mode-host',
+              '--ws-auth', '--ws-token-file', '--ws-token-sha256', '--ws-shared-secret-file',
+              '--ws-issuer', '--ws-audience', '--ws-max-clock-skew-seconds'}
+    for value in after:
+        if value in values:
+            next(after, None)
+        elif not value.startswith('-'):
+            return False
+    return True
+
+
 if __name__ == '__main__':
     require_codex()
-    if 'app-server' not in sys.argv[1:] or any(v in sys.argv for v in ('--help', '--version', 'generate-json-schema', 'generate-ts')):
+    if not wraps_server(sys.argv[1:]):
         os.execv(str(CODEX), [str(CODEX), *sys.argv[1:]])
     asyncio.run(serve(sys.argv[1:]))
