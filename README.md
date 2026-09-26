@@ -24,6 +24,16 @@ python3 dock.py install --icon /path/to/icon.icns
 
 An existing installed icon is preserved when `--icon` is omitted. The launcher is an applet; the actual running window belongs to the official Codex app.
 
+To also color the running Claude window's Dock icon, close Claude mode and run:
+
+```sh
+python3 app_icon.py install --icon /path/to/icon.icns
+```
+
+This opt-in feature makes a local copy at `~/.codex-claude/appearance/Claude Codex.app` and applies a normal macOS Finder custom icon. It preserves the signed executable, resources, app identity, and nested helpers; normal deep signature verification passes. Finder's icon metadata does fail `codesign --strict`'s extra metadata check. The installed app is untouched. A Dock restart may be needed to refresh its cached icon.
+
+Continue starting Claude with the launcher: a pinned copy launched directly after quitting does **not** retain the isolated Claude environment. The launcher and running app remain separate Dock items. Remove only the optional copy with `python3 app_icon.py remove`; this retains chats and the launcher.
+
 Claude mode uses `~/.codex-claude/home` for task/configuration state and `~/.codex-claude/desktop` for desktop state. It can run alongside regular Codex. Its tasks and settings are separate. No login credentials, browser profiles, or regular Codex task history are copied. The desktop initializes its own bundled plugins.
 
 Select Opus or Fable and the desired effort in that window. **Extra High** maps to `xhigh`, **Max** to `max`, and **Ultra** to Claude `ultracode`. Read-only side chats cannot use Ultracode because it needs workflow tools.
@@ -84,7 +94,7 @@ Removal checks the directory's ownership marker and refuses to delete an unrelat
 
 ## Updates and limits
 
-Update the official Codex app normally after finishing work and closing both instances. The adapter does not patch the app bundle or freeze a separate application version. Start Claude mode through its launcher after updating; do not assume an updater restart preserves the isolated launch environment. Future app-server, model-catalog, and browser-interface compatibility is not guaranteed. Regular Codex remains available if an adapter update is needed.
+Update the official Codex app normally after finishing work and closing both instances. The adapter does not patch the app bundle or freeze a separate application version. If the optional icon copy no longer matches the installed app, the launcher uses the updated official app with the same Claude profile; its icon may revert. Re-run the icon install command to create a matching copy. Start Claude mode through its launcher after updating; do not assume an updater restart preserves the isolated launch environment. Future app-server, model-catalog, and browser-interface compatibility is not guaranteed. Regular Codex remains available if an adapter update is needed.
 
 Voice is unavailable in Claude mode. Use regular Codex for voice. Audio/file attachments, Codex review/compaction commands, remote tasks, and scheduled work are not integrated. Inline image attachments are supported; remote image URLs are not fetched. The advertised Codex context budget is 100k tokens.
 

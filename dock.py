@@ -109,11 +109,8 @@ def install(icon=None):
     print('Prepared and pinned: ' + str(path))
 
 
-def remove(root=ROOT):
-    path = bundle(root)
-    if not path.exists() and not path.is_symlink():
-        return
-    verify_owned(path, root)
+def remove_tile(path):
+    """Remove only the Dock item whose file URL matches this app exactly."""
     entries = dock_entries()
     remaining = [e for e in entries if not is_our_tile(e, path)]
     if remaining != entries:
@@ -125,6 +122,14 @@ def remove(root=ROOT):
         refresh_dock()
         if any(is_our_tile(e, path) for e in dock_entries()):
             raise RuntimeError('Dock removal could not be verified; the app was retained.')
+
+
+def remove(root=ROOT):
+    path = bundle(root)
+    if not path.exists() and not path.is_symlink():
+        return
+    verify_owned(path, root)
+    remove_tile(path)
     shutil.rmtree(path)
 
 

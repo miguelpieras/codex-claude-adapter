@@ -21,6 +21,7 @@ from adapter import make_catalog, Core
 from native import MODEL, MODELS, atomic_json, check_auth
 from paths import APP, CODEX, require_codex
 from standalone import PROVIDER, service
+import app_icon
 
 ROOT = Path(__file__).resolve().parent
 HOME = Path.home() / '.codex'
@@ -43,6 +44,8 @@ def owned(directory):
 
 def app_running(directory):
     require_codex()
+    if app_icon.state(directory) is not None and app_icon.is_running(app_icon.bundle(directory)):
+        return True
     result = subprocess.run(['/bin/ps', '-axo', 'args='], capture_output=True, text=True, check=True)
     target = str(APP) + ' --user-data-dir=' + str(directory / 'desktop')
     return any(line.strip() == target or line.strip().startswith(target + ' ')
@@ -218,12 +221,13 @@ def launch(directory=DIRECTORY):
     # A healthy, pre-update service does not prove the installed app still
     # exists at a supported path. Validate before start() can return early.
     require_codex()
+    app = app_icon.select(APP, directory)
     start(directory)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('CODEX_', 'OPENAI_', 'ANTHROPIC_'))}
     env.update(CODEX_HOME=str(directory / 'home'), CODEX_ELECTRON_USER_DATA_PATH=str(directory / 'desktop'))
     # The official app already supports these isolated data paths. No CLI shim
     # or replacement binary is involved; both app and its core stay signed.
-    subprocess.Popen([str(APP), '--user-data-dir=' + str(directory / 'desktop')],
+    subprocess.Popen([str(app), '--user-data-dir=' + str(directory / 'desktop')],
         env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True)
     print('Opened isolated Claude mode. Regular Codex settings and tasks are unchanged.')
@@ -248,6 +252,7 @@ def remove(directory=DIRECTORY, *, delete_history=False):
                     time.sleep(.1)
             from dock import remove as remove_launcher
             remove_launcher(root=ROOT)
+            app_icon.remove(directory)
             if delete_history:
                 shutil.rmtree(directory)
     else:
