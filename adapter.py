@@ -35,7 +35,7 @@ def make_catalog(home, destination):
     entries = []
     for model, (name, default_effort) in MODELS.items():
         entry = copy.deepcopy(next((m for m in models if m['slug'] == 'gpt-5.5'), models[0]))
-        entry.update(slug=model, display_name=name + ' · Claude Code',
+        entry.update(slug=model, display_name=name.removeprefix('Claude '),
             description='Local Claude Code login. Ultra selects Claude Ultracode workflows.',
             priority=0, upgrade=None, available_access_programs={'cyber': []},
             additional_speed_tiers=[], service_tiers=[], context_window=100000,
