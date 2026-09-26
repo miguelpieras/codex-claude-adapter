@@ -14,7 +14,7 @@ import time
 import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import adapter
 import manage
@@ -31,8 +31,22 @@ if Path('deny-auth').exists():
  print(json.dumps({'type':'result','is_error':True,'result':'OAuth access token has been revoked'}));sys.exit(1)
 with Path('calls.jsonl').open('a') as f:f.write(json.dumps({'args':sys.argv,'envkeys':[k for k in os.environ if k.startswith(('ANTHROPIC_','OPENAI_','CLAUDE_'))],'subagent_model':os.environ.get('CLAUDE_CODE_SUBAGENT_MODEL'),'request':request})+'\\n')
 if 'SLOW' in json.dumps(request):time.sleep(1)
+model=sys.argv[sys.argv.index('--model')+1]
+print(json.dumps({'type':'system','subtype':'init','model':model,'apiKeySource':'ANTHROPIC_API_KEY' if 'BADKEY' in json.dumps(request) else 'none'}),flush=True)
+final='CLAUDE_FIXTURE history='+str('HISTORY_123' in json.dumps(request))
 print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','name':'Read','id':'tool_1','input':{'file_path':'fixture.txt'}}]}}),flush=True)
-print(json.dumps({'type':'result','is_error':False,'result':'CLAUDE_FIXTURE history='+str('HISTORY_123' in json.dumps(request)), 'modelUsage':{sys.argv[sys.argv.index('--model')+1]:{}},'usage':{'input_tokens':10,'output_tokens':10},'permission_denials':[]}))
+if 'STREAM' in json.dumps(request):
+ for e in [{'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':'Plan: '}},'parent_tool_use_id':None},
+  {'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':'read files'}},'parent_tool_use_id':None},
+  {'type':'assistant','message':{'content':[{'type':'thinking','thinking':'Plan: read files'}]},'parent_tool_use_id':None},
+  {'type':'assistant','message':{'content':[{'type':'text','text':'Looking around.'}]},'parent_tool_use_id':None},
+  {'type':'assistant','message':{'content':[{'type':'tool_use','name':'Bash','id':'t2','input':{'command':'npm test'}}]},'parent_tool_use_id':None},
+  {'type':'assistant','message':{'content':[{'type':'tool_use','name':'Grep','id':'t3','input':{'pattern':'TODO'}}]},'parent_tool_use_id':'t9','task_description':'Scan'},
+  {'type':'assistant','message':{'content':[{'type':'thinking','thinking':'subagent thought'}]},'parent_tool_use_id':'t9'},
+  {'type':'system','subtype':'permission_denied','tool_name':'Write'},
+  {'type':'assistant','message':{'content':[{'type':'text','text':final}]},'parent_tool_use_id':None}]:
+  print(json.dumps(e),flush=True)
+print(json.dumps({'type':'result','is_error':False,'result':final, 'modelUsage':{sys.argv[sys.argv.index('--model')+1]:{}},'usage':{'input_tokens':10,'output_tokens':10},'permission_denials':[]}))
 '''
 
 
@@ -59,6 +73,47 @@ class DispatchTests(unittest.TestCase):
                 self.assertTrue(adapter.wraps_server(args))
 
 
+class StreamTests(unittest.TestCase):
+    def events(self, run):
+        handler = type('Handler', (), {})()
+        handler.wfile = __import__('io').BytesIO()
+        stream = adapter.Stream(handler, native.MODEL)
+        run(stream)
+        return [json.loads(line[6:]) for line in handler.wfile.getvalue().decode().splitlines() if line.startswith('data: ')]
+
+    def test_progress_items_are_well_formed_and_closed(self):
+        def run(stream):
+            stream.emit('Plan', 'thinking'); stream.emit(' more', 'thinking'); stream.emit('Plan more', 'thinking_done')
+            stream.emit('- Ran `ls`', 'action'); stream.emit('- Read `a`', 'action')
+            stream.emit('note'); stream.emit('- Ran `x`', 'action')
+            stream.emit('', 'thinking_done')  # hidden thinking adds no empty item
+            stream.finish('answer', {})
+        events = self.events(run)
+        added = [e['item'] for e in events if e['type'] == 'response.output_item.added']
+        done = [e['item'] for e in events if e['type'] == 'response.output_item.done']
+        self.assertEqual([i['id'] for i in added], [i['id'] for i in done])
+        self.assertEqual([i['type'] for i in done], ['reasoning', 'message', 'message', 'message', 'message'])
+        self.assertEqual(done[0]['summary'], [{'type': 'summary_text', 'text': 'Plan more'}])
+        self.assertEqual(done[1]['content'][0]['text'], '- Ran `ls`\n- Read `a`')
+        self.assertEqual([i['phase'] for i in done[1:]], ['commentary', 'commentary', 'commentary', 'final_answer'])
+        deltas = [e['delta'] for e in events if e['type'] == 'response.reasoning_summary_text.delta']
+        self.assertEqual(''.join(deltas), 'Plan more')
+        completed = next(e for e in events if e['type'] == 'response.completed')['response']
+        self.assertEqual(completed['output'], done)
+
+    def test_heartbeat_is_a_real_event_not_a_comment(self):
+        handler = type('Handler', (), {})()
+        handler.wfile = __import__('io').BytesIO()
+        handler.connection = Mock()
+        stream = adapter.Stream(handler, native.MODEL)
+        stream.last_heartbeat -= 11
+        with patch.object(adapter.select, 'select', return_value=([], [], [])):
+            self.assertFalse(stream.cancelled())
+        raw = handler.wfile.getvalue().decode()
+        self.assertIn('event: response.in_progress', raw)
+        self.assertNotIn(': keepalive', raw)
+
+
 class NativeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -80,7 +135,7 @@ class NativeTests(unittest.TestCase):
                 'input': [{'role': 'user', 'content': text}]}
 
     def run_turn(self, tid, request):
-        return self.runtime.infer(tid, request, lambda text: None, lambda: False)
+        return self.runtime.infer(tid, request, lambda text, kind='message': None, lambda: False)
 
     def test_model_fail_closed(self):
         req = self.request()
@@ -104,6 +159,55 @@ class NativeTests(unittest.TestCase):
         self.assertIn('none', call['args'])
         self.assertNotIn('--bare', call['args'])
         self.assertNotIn('--dangerously-skip-permissions', call['args'])
+
+    def test_progress_shows_thinking_actions_and_interim_text_once(self):
+        seen = []
+        self.runtime.infer(self.thread, self.request('STREAM'), lambda text, kind='message': seen.append((kind, text)),
+                           lambda: False)
+        self.assertEqual(seen, [
+            ('action', '- **Read** `fixture.txt`'),
+            ('thinking', 'Plan: '), ('thinking', 'read files'),
+            ('thinking_done', ''),                    # deltas already carried the text
+            ('message', native.quote('Plan: read files')),
+            ('message', 'Looking around.'),          # interim text, flushed by the next action
+            ('action', '- **Bash** `npm test`'),
+            ('action', '- [Scan] **Grep** `TODO`'),  # subagent action; subagent thinking stays out
+            ('action', '- Blocked by permissions: **Write**')])  # final text is the answer, not commentary
+        args = json.loads((self.root / 'calls.jsonl').read_text())['args']
+        self.assertEqual(args[args.index('--thinking-display') + 1], 'summarized')
+        self.assertIn('--include-partial-messages', args)
+        self.assertEqual(args[args.index('--setting-sources') + 1], 'user')
+
+    def test_run_not_on_subscription_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'apiKeySource=ANTHROPIC_API_KEY'):
+            self.run_turn(self.thread, self.request('BADKEY'))
+
+    def test_fresh_session_skips_quoted_thinking_but_keeps_progress(self):
+        other = str(uuid.uuid4())
+        self.runtime.bind(other, self.root)
+        thinking = {'type': 'message', 'role': 'assistant', 'phase': 'commentary',
+                    'content': [{'type': 'output_text', 'text': native.quote('secret plan')}]}
+        progress = {'type': 'message', 'role': 'assistant', 'phase': 'commentary',
+                    'content': [{'type': 'output_text', 'text': '- **Bash** `ls`'}]}
+        request = self.request('fresh')
+        request['input'] = [*request['input'], {'type': 'reasoning', 'id': 'rs_1', 'summary': []}, thinking, progress]
+        self.run_turn(other, request)
+        sent = json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])['request']
+        self.assertFalse(sent['continuation'])
+        self.assertEqual([i.get('type') or i.get('role') for i in sent['input']], ['user', 'message'])
+        self.assertEqual(sent['input'][1]['content'][0]['text'], '- **Bash** `ls`')
+
+    def test_resumed_turn_does_not_replay_streamed_progress(self):
+        first = self.request('first')
+        self.run_turn(self.thread, first)
+        progress = [{'type': 'reasoning', 'id': 'rs_1', 'summary': [], 'content': None, 'encrypted_content': None},
+                    {'type': 'message', 'role': 'assistant', 'phase': 'commentary', 'content': [{'type': 'output_text', 'text': '- Ran `ls`'}]},
+                    {'type': 'message', 'role': 'assistant', 'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': 'CLAUDE_FIXTURE'}]}]
+        second = {**first, 'input': [*first['input'], *progress, {'role': 'user', 'content': 'next'}]}
+        self.run_turn(self.thread, second)
+        sent = json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])['request']
+        self.assertTrue(sent['continuation'])
+        self.assertEqual([i.get('phase') or i.get('role') for i in sent['input']], ['final_answer', 'user'])
 
     def test_permission_modes_and_read_only_side_chats(self):
         threads = []

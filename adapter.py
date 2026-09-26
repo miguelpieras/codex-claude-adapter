@@ -65,7 +65,68 @@ class Stream:
                          'status': 'in_progress', 'usage': None, 'error': None}
         self.sequence = 0
         self.last_heartbeat = time.monotonic()
+        self.open = None  # streaming reasoning or action-list item, closed before any other item
         self.event('response.created', response=self.response)
+
+    def emit(self, text, kind='message'):
+        """Native progress: 'message' commentary, 'action' list line, 'thinking' delta, 'thinking_done' full text."""
+        if kind == 'action':
+            if not self.open or self.open['kind'] != 'action':
+                self.close_open()
+                self.start('action', {'type': 'message', 'id': 'msg_' + uuid.uuid4().hex, 'role': 'assistant',
+                                      'phase': 'commentary', 'status': 'in_progress', 'content': []})
+                self.event('response.content_part.added', **self.open['common'],
+                           part={'type': 'output_text', 'text': '', 'annotations': []})
+            self.delta(text + '\n')
+        elif kind in ('thinking', 'thinking_done'):
+            reasoning_open = bool(self.open) and self.open['kind'] == 'reasoning'
+            if kind == 'thinking_done' and not text and not reasoning_open:
+                return  # hidden thinking: an empty reasoning item would render nothing
+            if not reasoning_open:
+                self.close_open()
+                self.start('reasoning', {'type': 'reasoning', 'id': 'rs_' + uuid.uuid4().hex, 'summary': []})
+                self.event('response.reasoning_summary_part.added', **self.open['common'],
+                           part={'type': 'summary_text', 'text': ''})
+            if kind == 'thinking':
+                self.delta(text)
+            else:
+                # Add only what the live deltas missed; never repeat streamed text.
+                if text.startswith(self.open['text']) and len(text) > len(self.open['text']):
+                    self.delta(text[len(self.open['text']):])
+                self.close_open()
+        else:
+            self.close_open()
+            self.message(text)
+
+    def start(self, kind, item):
+        index = len(self.response['output'])
+        common = {'item_id': item['id'], 'output_index': index}
+        common.update(summary_index=0) if kind == 'reasoning' else common.update(content_index=0)
+        self.open = {'kind': kind, 'item': item, 'index': index, 'common': common, 'text': ''}
+        self.event('response.output_item.added', output_index=index, item=item)
+
+    def delta(self, text):
+        self.open['text'] += text
+        name = 'response.reasoning_summary_text.delta' if self.open['kind'] == 'reasoning' else 'response.output_text.delta'
+        self.event(name, **self.open['common'], delta=text)
+
+    def close_open(self):
+        if not self.open:
+            return
+        state, self.open = self.open, None
+        text, common, index = state['text'], state['common'], state['index']
+        if state['kind'] == 'reasoning':
+            part = {'type': 'summary_text', 'text': text}
+            self.event('response.reasoning_summary_text.done', **common, text=text)
+            self.event('response.reasoning_summary_part.done', **common, part=part)
+            item = {**state['item'], 'summary': [part]}
+        else:
+            part = {'type': 'output_text', 'text': text.rstrip('\n'), 'annotations': []}
+            self.event('response.output_text.done', **common, text=part['text'])
+            self.event('response.content_part.done', **common, part=part)
+            item = {**state['item'], 'status': 'completed', 'content': [part]}
+        self.event('response.output_item.done', output_index=index, item=item)
+        self.response['output'].append(item)
 
     def event(self, kind, **data):
         data.update(type=kind, sequence_number=self.sequence)
@@ -93,12 +154,14 @@ class Stream:
         if select.select([conn], [], [], 0)[0] and not conn.recv(1, socket.MSG_PEEK):
             return True
         if time.monotonic() - self.last_heartbeat > 10:
-            self.handler.wfile.write(b': keepalive\n\n')
-            self.handler.wfile.flush()
+            # Codex's idle timer (300s) ignores SSE comments; only real events reset it.
+            self.event('response.in_progress', response={'id': self.response['id'], 'object': 'response',
+                                                          'status': 'in_progress'})
             self.last_heartbeat = time.monotonic()
         return False
 
     def finish(self, text, usage):
+        self.close_open()
         self.message(text, 'final_answer')
         incoming = sum(usage.get(k, 0) for k in ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
         outgoing = usage.get('output_tokens', 0)
@@ -145,13 +208,17 @@ class Handler(BaseHTTPRequestHandler):
         stream = Stream(self, data['model'])
         try:
             metadata = self.headers.get('x-codex-turn-metadata') or (data.get('client_metadata') or {}).get('x-codex-turn-metadata')
-            final, usage = self.server.native.infer(thread_id, data, stream.message, stream.cancelled,
+            # This legacy wrapper shares ~/.codex tasks with OpenAI models, which must never
+            # receive locally made reasoning items; thinking reaches it as quoted commentary only.
+            emit = lambda text, kind='message': None if kind in ('thinking', 'thinking_done') else stream.emit(text, kind)
+            final, usage = self.server.native.infer(thread_id, data, emit, stream.cancelled,
                                                    browser_metadata=metadata)
             stream.finish(final, usage)
         except (BrokenPipeError, ConnectionResetError):
             self.server.native.cancel(thread_id)
         except Exception as error:
             try:
+                stream.close_open()
                 stream.event('error', error={'code': 'claude_code_error', 'message': str(error)[:1200]})
             except OSError:
                 pass

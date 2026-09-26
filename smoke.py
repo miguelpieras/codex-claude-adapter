@@ -34,15 +34,16 @@ def main():
             prompt += 'Reply briefly with the fixture contents.'
             start = time.monotonic()
             final, _ = runtime.infer(tid, {'model': MODEL, 'input': [{'role': 'user', 'content': prompt}],
-                'reasoning': {'effort': 'low'}}, events.append, lambda: False)
+                'reasoning': {'effort': 'low'}}, lambda text, kind='message': events.append((kind, text)), lambda: False)
             end = time.monotonic()
             assert (cwd / 'result.txt').read_text().strip() == 'adapter-native-' + str(i)
-            assert any('using Read.' in v for v in events), events
-            assert any('using Write.' in v for v in events), events
+            actions = [v for k, v in events if k == 'action']
+            assert any(v.startswith('- **Read**') for v in actions), events
+            assert any(v.startswith('- **Write**') for v in actions), events
             if i == 0:
-                assert any('using Agent.' in v for v in events), events
+                assert any(v.startswith('- **Agent**') for v in actions), events
             spans.append((start, end))
-            return {'task': i, 'verified_file': True, 'native_tools': [v for v in events if 'is using' in v],
+            return {'task': i, 'verified_file': True, 'native_tools': actions,
                     'model': MODEL, 'answer': final, 'seconds': round(end-start, 2)}
         try:
             with ThreadPoolExecutor(2) as pool:

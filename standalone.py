@@ -24,6 +24,8 @@ from browser import BrowserBridge
 
 PROVIDER = 'claude-standalone'
 COORDINATION = {'list_threads', 'read_thread', 'wait_threads', 'send_message_to_thread'}
+APPROVAL_WAIT = 3600  # seconds a Claude permission question waits for the user
+QUESTION_LIMIT = 4000  # longer requests are denied rather than shown truncated
 SYSTEM = native.SYSTEM.replace('Other Codex app connectors and\nvoice are unavailable.',
     'Explicitly exposed Codex task coordination MCP tools are also available. Voice is unavailable.').replace(
     'different provider, explain that they must switch this task\'s dropdown.',
@@ -140,6 +142,7 @@ class Turn:
         self.stopped = threading.Event()
         self.http_lock, self.tool_lock = threading.Lock(), threading.Lock()
         self.pending = None
+        self.unseen = None  # index of a steered user message Claude never received
         self.completed = False
         self.done = threading.Event()
         self.last_input = request.get('input', [])
@@ -171,8 +174,10 @@ class Relay(BrowserBridge):
                     'tool_name': {'type': 'string'}, 'input': {'type': 'object'}, 'tool_use_id': {'type': 'string'}}}})
         with self.guard:
             self.sessions[token] = {'thread': thread_id, 'turn': turn, 'tools': tools}
+        # Claude Code abandons MCP calls after 60s by default; a permission question
+        # may wait for the user up to APPROVAL_WAIT.
         return token, {'mcpServers': {'codex_browser': {
-            'type': 'http', 'url': self.url,
+            'type': 'http', 'url': self.url, 'timeout': (APPROVAL_WAIT + 100) * 1000,
             'headers': {'Authorization': 'Bearer ' + token}}}}
 
     async def call(self, token, name, arguments):
@@ -229,10 +234,17 @@ class Relay(BrowserBridge):
         tool_name, tool_input = arguments.get('tool_name'), arguments.get('input')
         if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
             raise ValueError('Invalid Claude permission request.')
-        detail = next((tool_input[k] for k in ('command', 'file_path', 'url', 'pattern')
-                       if isinstance(tool_input.get(k), str)), None) or json.dumps(tool_input)
-        question = 'Allow Claude to use ' + tool_name + ': ' + detail
-        question = question if len(question) <= 300 else question[:297] + '...'
+        # "Allow" approves exactly what the user saw: the whole input, never a truncation.
+        if tool_name == 'Bash' and isinstance(tool_input.get('command'), str):
+            extra = {k: v for k, v in tool_input.items() if k not in ('command', 'description')}
+            detail = tool_input['command'] + (' ' + json.dumps(extra, ensure_ascii=False) if extra else '')
+        else:
+            detail = json.dumps(tool_input, ensure_ascii=False)
+        question = 'Allow Claude to use ' + tool_name + '? ' + detail
+        if len(question) > QUESTION_LIMIT:
+            reason = ('This ' + tool_name + ' request is too long to show in full for approval (' + str(len(detail)) +
+                      ' characters), so it was not approved. Split it into smaller steps, or use "Approve for me".')
+            return {'content': [{'type': 'text', 'text': json.dumps({'behavior': 'deny', 'message': reason})}]}
         questions = [{'id': 'claude_permission', 'header': 'Claude', 'question': question, 'options': [
             {'label': 'Allow', 'description': 'Let Claude run this action once.'},
             {'label': 'Deny', 'description': 'Block it; Claude continues without it.'}]}]
@@ -241,7 +253,7 @@ class Relay(BrowserBridge):
                 raise ValueError('Cancelled task.')
             output = self.forward(turn, {'type': 'function_call', 'id': 'fc_' + uuid.uuid4().hex,
                 'call_id': 'call_' + uuid.uuid4().hex, 'status': 'completed',
-                'name': 'request_user_input', 'arguments': json.dumps({'questions': questions})}, 3600)
+                'name': 'request_user_input', 'arguments': json.dumps({'questions': questions})}, APPROVAL_WAIT)
         try:
             answers = json.loads(output)['answers']['claude_permission']['answers']
         except (ValueError, KeyError, TypeError):
@@ -261,6 +273,12 @@ class Relay(BrowserBridge):
 
 
 class ServiceHandler(Handler):
+    def _review(self, request, cwd, cancelled):
+        try:
+            return self.server.native.review(request, cwd, cancelled)
+        except Exception as error:
+            return error
+
     def do_GET(self):
         if self.path == '/status' and hmac.compare_digest(self.headers.get('X-Local-Claude-Token', ''), self.server.token):
             raw = json.dumps({'provider': PROVIDER, 'pid': __import__('os').getpid(),
@@ -299,12 +317,27 @@ class ServiceHandler(Handler):
             metadata = json.loads((request.get('client_metadata') or {}).get('x-codex-turn-metadata') or '{}')
             review_cwd = review_for(self.server.home, request.get('model'), metadata, self.headers)
             if review_cwd:
-                verdict, usage = self.server.native.review(request, review_cwd)
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Connection', 'close')
                 self.end_headers()
-                Stream(self, request['model']).finish(verdict, usage)
+                streaming = True
+                stream = Stream(self, request['model'])
+                outcome, abandon = queue.Queue(), threading.Event()
+                threading.Thread(target=lambda: outcome.put(self._review(request, review_cwd, abandon.is_set)),
+                                 daemon=True).start()
+                while True:  # heartbeats keep Codex's idle timer alive during the review
+                    if stream.cancelled():
+                        abandon.set()
+                        raise ValueError('Disconnected client; review abandoned.')
+                    try:
+                        result = outcome.get(timeout=.25)
+                        break
+                    except queue.Empty:
+                        pass
+                if isinstance(result, Exception):
+                    raise result
+                stream.finish(*result)
                 return
             binding = binding_for(self.server.home, tid, request.get('model'), metadata)
             if not isinstance(request.get('input'), list) or request.get('previous_response_id'):
@@ -320,6 +353,16 @@ class ServiceHandler(Handler):
                 Stream(self, request['model']).finish(state['result'], state.get('usage', {}))
                 return
             self.server.requests.append({'model': request['model'], 'thread': tid})
+            with self.server.guard:
+                previous = self.server.turns.get(tid)
+                abandoned = (previous is not None and not previous.completed and not previous.stopped.is_set()
+                             and metadata.get('turn_id') != previous.metadata.get('turn_id'))
+            if abandoned:
+                # Codex moved on (Stop, then a new message) while Claude waited for a host
+                # result such as a permission answer. End that run; this request starts fresh.
+                previous.stopped.set()
+                self.server.native.cancel(tid)
+                previous.done.wait(10)
             with self.server.guard:
                 turn = self.server.turns.get(tid)
                 fresh = turn is None or turn.completed
@@ -340,6 +383,16 @@ class ServiceHandler(Handler):
                 matches = [item for item in request.get('input', []) if item.get('type') == 'function_call_output' and item.get('call_id') == turn.pending]
                 if len(matches) != 1 or not turn.pending or turn.stopped.is_set():
                     raise ValueError('Missing exact host result; automatic replay refused.')
+                # Claude cannot take input mid-run. A user message Codex steered into this
+                # continuation stays unread, so Claude receives it with the next turn.
+                new = request['input'][len(turn.last_input):]
+                steered = next((k for k, item in enumerate(new) if isinstance(item, dict) and item.get('role') == 'user'
+                                and not str(((item.get('content') or [{}])[0] or {}).get('text', '')).startswith('<environment_context>')),
+                               None)
+                if steered is not None and turn.unseen is None:
+                    turn.unseen = len(turn.last_input) + steered
+                    turn.events.put(('message', "Claude can't read messages sent while it works. "
+                                                'It will receive this one together with your next message.'))
                 turn.outputs.put(matches[0]['output'])
             turn.last_input = request['input']
             turn.last_request = native.digest(request)
@@ -353,7 +406,7 @@ class ServiceHandler(Handler):
                 def worker():
                     try:
                         final, usage = self.server.native.infer(tid, request,
-                            lambda text: turn.events.put(('message', text)), turn.stopped.is_set,
+                            lambda text, kind='message': turn.events.put((kind, text)), turn.stopped.is_set,
                             browser_metadata=metadata)
                         turn.events.put(('final', (final, usage)))
                     except Exception as error:
@@ -368,9 +421,10 @@ class ServiceHandler(Handler):
                     kind, value = turn.events.get(timeout=.25)
                 except queue.Empty:
                     continue
-                if kind == 'message':
-                    stream.message(value)
+                if kind in ('message', 'action', 'thinking', 'thinking_done'):
+                    stream.emit(value, kind)
                 elif kind == 'call':
+                    stream.close_open()
                     index = len(stream.response['output'])
                     stream.event('response.output_item.added', output_index=index, item={**value, 'status': 'in_progress', 'arguments': ''})
                     stream.event('response.function_call_arguments.delta', item_id=value['id'], output_index=index, delta=value['arguments'])
@@ -386,7 +440,8 @@ class ServiceHandler(Handler):
                     # present the same host call/results as fresh work.
                     path = self.server.native.directory / (tid + '.json')
                     state = json.loads(path.read_text())
-                    state.update(input_count=len(turn.last_input), input_digest=native.digest(turn.last_input),
+                    seen = turn.last_input[:turn.unseen] if turn.unseen is not None else turn.last_input
+                    state.update(input_count=len(seen), input_digest=native.digest(seen),
                                  response_request_digest=turn.last_request)
                     native.atomic_json(path, state)
                     stream.finish(*value)
@@ -400,6 +455,7 @@ class ServiceHandler(Handler):
                 self.server.native.cancel(turn.tid)
             if streaming:
                 try:
+                    stream.close_open()  # keep already-streamed progress in the task history
                     stream.event('error', error={'code': 'claude_service_error', 'message': str(error)[:1200]})
                 except OSError:
                     pass

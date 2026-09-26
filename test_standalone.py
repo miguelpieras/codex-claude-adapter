@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 import threading
 import unittest
 import urllib.error
@@ -265,6 +266,60 @@ class RelayTests(unittest.TestCase):
         self.post({**request, 'input': [call, {'type': 'function_call_output', 'call_id': call['call_id'],
             'output': json.dumps({'answers': {'claude_permission': {'answers': ['Deny', 'use make clean']}}})}]})
         self.assertEqual(decisions, [{'behavior': 'deny', 'message': 'The user denied this action: use make clean'}])
+
+    def test_approval_question_shows_whole_input_or_refuses(self):
+        turn, relay = service.Turn(self.tid, self.request, self.metadata), self.server.browser
+        big = relay.approve(turn, {'tool_name': 'Bash', 'input': {'command': 'x' * 5000}})
+        self.assertEqual(json.loads(big['content'][0]['text'])['behavior'], 'deny')
+        self.assertTrue(turn.events.empty())  # never asked: the user could not see it all
+        answer = json.dumps({'answers': {'claude_permission': {'answers': ['Allow']}}})
+        threading.Thread(target=lambda: (time.sleep(.3), turn.outputs.put(answer)), daemon=True).start()
+        result = relay.approve(turn, {'tool_name': 'Grep', 'input': {'pattern': 'key', 'path': '/etc'}})
+        question = json.loads(turn.events.get_nowait()[1]['arguments'])['questions'][0]['question']
+        self.assertIn('"path": "/etc"', question)
+        self.assertEqual(json.loads(result['content'][0]['text']),
+                         {'behavior': 'allow', 'updatedInput': {'pattern': 'key', 'path': '/etc'}})
+
+    def test_relay_mcp_timeout_outlasts_the_approval_wait(self):
+        self.server.turns[self.tid] = service.Turn(self.tid, self.request, self.metadata)
+        self.server.native.bind(self.tid, str(self.home))
+        token, config = self.server.browser.open(self.tid, self.metadata, model=native.MODEL)
+        self.server.browser.close(token)
+        self.assertGreater(config['mcpServers']['codex_browser']['timeout'], service.APPROVAL_WAIT * 1000)
+
+    def test_new_turn_after_stop_replaces_a_turn_waiting_for_an_answer(self):
+        calls = []
+        def infer(tid, request, emit, cancelled, **kwargs):
+            calls.append(request)
+            if len(calls) == 1:
+                token, _ = self.server.browser.open(tid, self.metadata, model=native.MODEL)
+                try:
+                    asyncio.run(self.server.browser.call(token, native.APPROVAL,
+                        {'tool_name': 'Bash', 'input': {'command': 'ls'}}))
+                finally:
+                    self.server.browser.close(token)
+            native.atomic_json(self.server.native.directory / (tid + '.json'),
+                {'status': 'completed', 'result': 'second', 'usage': {}})
+            return 'second', {}
+        self.server.native.infer = infer
+        ask = {'type': 'function', 'name': 'request_user_input', 'parameters': {'type': 'object'}}
+        first = {**self.request, 'tools': [*self.request['tools'], ask]}
+        call = next(v for v in self.post(first)['output'] if v['type'] == 'function_call')
+        self.assertEqual(call['name'], 'request_user_input')
+        # The user pressed Stop, then sent a new message: Codex starts a new turn.
+        second = {**first, 'client_metadata': {'x-codex-turn-metadata': json.dumps({**self.metadata, 'turn_id': str(uuid.uuid4())})}}
+        self.assertEqual(self.post(second)['output'][-1]['content'][0]['text'], 'second')
+        self.assertEqual(len(calls), 2)
+
+    def test_message_steered_mid_run_is_kept_for_the_next_turn(self):
+        call = next(v for v in self.post(self.request)['output'] if v['type'] == 'function_call')
+        steer = {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'also check X'}]}
+        final = self.post({**self.request, 'input': [call, {'type': 'function_call_output',
+            'call_id': call['call_id'], 'output': 'ok'}, steer]})
+        notes = [i['content'][0]['text'] for i in final['output'] if i.get('phase') == 'commentary']
+        self.assertTrue(any('next message' in n for n in notes), notes)
+        state = json.loads((self.server.native.directory / (self.tid + '.json')).read_text())
+        self.assertEqual(state['input_count'], 2)  # the steered message stays unread for Claude
 
     def test_wrong_tool_result_cancels_instead_of_replaying(self):
         self.post(self.request)

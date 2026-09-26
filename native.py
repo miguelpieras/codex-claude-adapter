@@ -8,6 +8,7 @@ import queue
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from paths import CLAUDE
 
@@ -17,6 +18,44 @@ MODELS = {MODEL: ('Claude Opus 5.5', 'medium'), FABLE: ('Claude Fable 5.1', 'hig
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 APPROVAL = 'claude_permission'  # relay MCP tool that answers Claude permission prompts
 PERMISSIONS = ('auto', 'manual', 'bypassPermissions')
+# Only the user's own Claude settings; a repository's .claude/settings*.json must not
+# change permissions, credentials or endpoints for Claude-mode turns.
+SETTINGS = ('--setting-sources', 'user')
+THINKING_QUOTE = '> **Thinking**'
+# Tool name -> input field shown in the action list. Lines name the requested tool call;
+# they do not claim it ran (a permission check may still block it).
+ACTIONS = {'Bash': 'command', 'Read': 'file_path', 'Edit': 'file_path', 'MultiEdit': 'file_path',
+           'Write': 'file_path', 'NotebookEdit': 'notebook_path', 'Grep': 'pattern', 'Glob': 'pattern',
+           'WebFetch': 'url', 'WebSearch': 'query', 'Agent': 'description', 'Task': 'description'}
+
+
+def code(text):
+    """Inline markdown code that survives backticks in the text."""
+    lines = text.strip().splitlines() or ['']
+    text = lines[0] if len(lines) == 1 else lines[0] + ' …'
+    text = text if len(text) <= 160 else text[:159] + '…'
+    run, longest = 0, 0
+    for char in text:
+        run = run + 1 if char == '`' else 0
+        longest = max(longest, run)
+    fence = '`' * (longest + 1)
+    pad = ' ' if text.startswith('`') or text.endswith('`') else ''
+    return fence + pad + text + pad + fence
+
+
+def describe(block, event):
+    """One visible label for a Claude tool call, e.g. "**Bash** `npm test`"."""
+    name, args = str(block.get('name') or 'tool'), block.get('input') or {}
+    value = args.get(ACTIONS.get(name, ''))
+    label = '**' + name + '**' + (' ' + code(value) if isinstance(value, str) and value.strip() else '')
+    if event.get('parent_tool_use_id'):
+        label = '[' + str(event.get('task_description') or 'agent') + '] ' + label
+    return label
+
+
+def quote(text):
+    lines = [THINKING_QUOTE[2:], ''] + text.strip().splitlines()
+    return '\n'.join('> ' + line if line.strip() else '>' for line in lines)
 
 def claude_effort(model, effort=None):
     if model not in MODELS:
@@ -66,7 +105,7 @@ def environment(model=MODEL):
 def check_auth(cwd):
     if not CLAUDE.is_file():
         raise ValueError('Install Claude Code and log in with your Claude subscription, or set CODEX_ADAPTER_CLAUDE to its executable.')
-    run = subprocess.run([str(CLAUDE), '--safe-mode', '--strict-mcp-config', 'auth', 'status'],
+    run = subprocess.run([str(CLAUDE), *SETTINGS, '--safe-mode', '--strict-mcp-config', 'auth', 'status'],
                          cwd=cwd, env=environment(), capture_output=True, text=True, timeout=20)
     try:
         auth = json.loads(run.stdout)
@@ -76,6 +115,15 @@ def check_auth(cwd):
             or auth.get('apiProvider') != 'firstParty'
             or auth.get('subscriptionType') not in ('max', 'pro', 'team', 'enterprise')):
         raise ValueError('Sign into local Claude Code with your Claude subscription. API fallback is disabled.')
+
+
+def stop(process):
+    """Terminate a Claude process group started with start_new_session=True."""
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):  # exited (EPERM = unreaped zombie on macOS)
+            pass
 
 
 def atomic_json(path, data):
@@ -136,6 +184,7 @@ class NativeRuntime:
         self.guard = threading.RLock()
         self.locks = {}
         self.running = {}
+        self.reviews = set()  # reviewer processes, killed on close
         self.bindings = {}
         self.browser = None
         self.system = system
@@ -158,12 +207,14 @@ class NativeRuntime:
         if process and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):  # exited (EPERM = unreaped zombie on macOS)
                 pass
 
     def close(self):
         for thread_id in list(self.running):
             self.cancel(thread_id)
+        for process in list(self.reviews):
+            stop(process)
 
     def infer(self, thread_id, request, emit, cancelled, *, browser_metadata=None):
         model = request.get('model')
@@ -209,8 +260,20 @@ class NativeRuntime:
                       and isinstance(inputs, list) and prefix > 0 and len(inputs) > prefix
                       and digest(inputs[:prefix]) == state.get('input_digest'))
             session_id = state['session_id'] if resume else str(uuid.uuid4())
-            payload = {'instructions': request.get('instructions'),
-                       'input': inputs[prefix:] if resume else inputs,
+            # Codex replays the thinking and progress items streamed below. Reasoning and
+            # quoted thinking carry nothing Claude should reread; a resumed Claude session
+            # already holds its own history, so it skips all progress commentary.
+            def replayed_progress(item):
+                if not isinstance(item, dict):
+                    return False
+                if item.get('type') == 'reasoning':
+                    return True
+                if item.get('phase') != 'commentary':
+                    return False
+                text = str(((item.get('content') or [{}])[0] or {}).get('text', ''))
+                return resume or text.startswith(THINKING_QUOTE)
+            tail = [item for item in (inputs[prefix:] if resume else inputs) if not replayed_progress(item)]
+            payload = {'instructions': request.get('instructions'), 'input': tail,
                        'continuation': bool(resume)}
             framed = inline_image_message(payload) if media else None
             customization = ['--safe-mode']
@@ -236,12 +299,14 @@ class NativeRuntime:
                                    '--permission-prompt-tool', 'mcp__codex_browser__' + APPROVAL]
                 else:
                     emit('Codex browser tools are unavailable for this task; native Claude tools remain available.')
-            cmd = [str(CLAUDE), *customization, '--strict-mcp-config',
+            cmd = [str(CLAUDE), *SETTINGS, *customization, '--strict-mcp-config',
                    '--permission-mode', permission, *prompts,
                    '--model', model, '--effort', effort, '--tools',
                    'Read,Glob,Grep' if binding['readonly'] else 'default',
                    '--append-system-prompt', self.system, '--output-format', 'stream-json',
-                   '--verbose', '--forward-subagent-text', '-p']
+                   '--verbose', '--forward-subagent-text', '-p',
+                   # Readable thinking (hidden by default under -p), streamed live as it is written.
+                   '--thinking-display', 'summarized', '--include-partial-messages']
             cmd += ['--resume' if resume else '--session-id', session_id]
             if framed:
                 cmd += ['--input-format', 'stream-json']
@@ -266,6 +331,17 @@ class NativeRuntime:
             process.stdin.write(json.dumps(framed or payload) + ('\n' if framed else ''))
             process.stdin.close()
             result = None
+            denials = []
+            labels = {}  # tool_use_id -> action label, to name blocked calls
+            streamed = False  # main-thread thinking already delivered as live deltas
+            # Claude sends one content block per event. The latest main-thread text is
+            # interim commentary unless it turns out to be the final answer (result.result).
+            pending = None
+            def flush():
+                nonlocal pending
+                if pending:
+                    emit(pending)
+                pending = None
             while True:
                 if cancelled():
                     self.cancel(thread_id)
@@ -280,15 +356,43 @@ class NativeRuntime:
                     event = json.loads(line)
                 except ValueError:
                     continue
-                if event.get('type') == 'assistant':
-                    blocks = event.get('message', {}).get('content', [])
-                    calls = [b for b in blocks if b.get('type') == 'tool_use']
-                    if calls:
-                        for b in blocks:
-                            if b.get('type') == 'text' and b.get('text'):
-                                emit(b['text'])
-                elif event.get('type') == 'result':
+                kind, main = event.get('type'), not event.get('parent_tool_use_id')
+                if kind == 'system' and event.get('subtype') == 'init':
+                    # Settings or environment must never move this run to an API key or model.
+                    if event.get('apiKeySource') != 'none' or event.get('model') != model:
+                        self.cancel(thread_id)
+                        raise ValueError('Claude Code did not start on your subscription login with ' + model +
+                                         ' (apiKeySource=' + str(event.get('apiKeySource')) + '). Nothing was sent to a fallback.')
+                elif kind == 'stream_event' and main:
+                    delta = (event.get('event') or {}).get('delta') or {}
+                    if delta.get('type') == 'thinking_delta' and delta.get('thinking'):
+                        flush()
+                        streamed = True
+                        emit(delta['thinking'], 'thinking')
+                elif kind == 'assistant':
+                    for block in (event.get('message') or {}).get('content') or []:
+                        if block.get('type') == 'thinking' and main:
+                            flush()
+                            thought = block.get('thinking') or ''
+                            # Whole block after live deltas only closes the live item.
+                            emit('' if streamed else thought, 'thinking_done')
+                            streamed = False
+                            if thought.strip():
+                                emit(quote(thought))
+                        elif block.get('type') == 'tool_use':
+                            if main:
+                                flush()
+                            labels[block.get('id')] = describe(block, event)
+                            emit('- ' + labels[block.get('id')], 'action')
+                        elif block.get('type') == 'text' and main and (block.get('text') or '').strip():
+                            flush()
+                            pending = block['text']
+                elif kind == 'system' and event.get('subtype') == 'permission_denied':
+                    blocked = labels.get(event.get('tool_use_id')) or '**' + str(event.get('tool_name') or 'tool') + '**'
+                    emit('- Blocked by permissions: ' + blocked, 'action')
+                elif kind == 'result':
                     result = event
+                    denials += event.get('permission_denials') or []
             process.wait(timeout=10)
             if not result or process.returncode or result.get('is_error'):
                 reason = str((result or {}).get('result', 'Claude Code did not finish successfully.'))
@@ -301,7 +405,8 @@ class NativeRuntime:
             final = result.get('result', '')
             if not final:
                 raise ValueError('Claude returned no final answer.')
-            denials = result.get('permission_denials', [])
+            if pending and pending.strip() != final.strip():
+                flush()  # interim text from before a background-agent follow-up
             if denials:
                 final += '\n\nClaude Code denied ' + str(len(denials)) + ' tool permission request(s). Those actions were not approved.'
             state.update(status='completed', result=final, usage=result.get('usage', {}))
@@ -321,14 +426,17 @@ class NativeRuntime:
                     try:
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
                         process.wait()
                 with self.guard:
                     self.running.pop(thread_id, None)
                 process.stdout.close()
             lock.release()
 
-    def review(self, request, cwd):
+    def review(self, request, cwd, cancelled=lambda: False):
         """Answer Codex's "Approve for me" reviewer with one tool-less Claude call."""
         model = request.get('model')
         effort = claude_effort(model, (request.get('reasoning') or {}).get('effort'))
@@ -345,18 +453,44 @@ class NativeRuntime:
             else:
                 transcript.append(json.dumps(item))
         check_auth(cwd)
-        cmd = [str(CLAUDE), '--safe-mode', '--strict-mcp-config', '--no-session-persistence',
+        cmd = [str(CLAUDE), *SETTINGS, '--safe-mode', '--strict-mcp-config', '--no-session-persistence',
                '--permission-mode', 'auto', '--permission-prompts', 'none', '--model', model,
-               '--effort', effort, '--tools', '', '--system-prompt', instructions, '--output-format', 'json', '-p']
+               '--effort', effort, '--tools', '', '--system-prompt', instructions,
+               '--output-format', 'stream-json', '--verbose', '-p']
         if schema:
             cmd += ['--json-schema', json.dumps(schema)]
-        run = subprocess.run(cmd, input='\n\n'.join(transcript), cwd=cwd, env=environment(model),
-                             capture_output=True, text=True, timeout=600)
+        process = subprocess.Popen(cmd, cwd=cwd, env=environment(model), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                   start_new_session=True)
+        with self.guard:
+            self.reviews.add(process)
+        output = []
         try:
-            result = json.loads(run.stdout)
-        except ValueError:
+            reader = threading.Thread(target=lambda: output.extend(
+                process.communicate('\n\n'.join(transcript))[0].splitlines()), daemon=True)
+            reader.start()
+            deadline = time.monotonic() + 600
+            while reader.is_alive():
+                if cancelled() or time.monotonic() > deadline:
+                    raise ValueError('Claude review was cancelled; the action was not approved.')
+                reader.join(.25)
+        finally:
+            with self.guard:
+                self.reviews.discard(process)
+            stop(process)
+        events = []
+        for line in output:
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                pass
+        init = next((e for e in events if e.get('type') == 'system' and e.get('subtype') == 'init'), {})
+        result = next((e for e in reversed(events) if e.get('type') == 'result'), None)
+        if init.get('apiKeySource') != 'none' or init.get('model') != model:
+            raise ValueError('Claude reviewer did not start on your subscription login with ' + model + '; the action was not approved.')
+        if not result:
             raise ValueError('Claude reviewer returned no result; the action was not approved.')
-        if run.returncode or result.get('is_error'):
+        if process.returncode or result.get('is_error'):
             raise ValueError(str(result.get('result', 'Claude reviewer failed.'))[:1000])
         if set(result.get('modelUsage', {})) != {model}:
             raise ValueError('Claude did not confirm exclusive ' + model + ' review inference. Refusing a silent model fallback.')

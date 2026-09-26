@@ -48,16 +48,24 @@ The service checks that local Claude Code is authenticated with `claude.ai`, a f
 
 Main inference and native Agent subagents are pinned to the selected Claude model. Recorded parent and child transcripts have verified Opus 5.5; Fable's transcript verified Fable 5.1. Native automatic permission classification is controlled by Claude Code and may use another Anthropic model. It is not covered by the task-model pin.
 
-Unknown models and missing attribution are rejected. Codex's own reviewer requests arrive at this local provider with the task's Claude model and are answered by Claude (see below); nothing is routed to OpenAI. This routing guarantee is not a network firewall preventing an explicitly requested shell command from contacting another service.
+Unknown models and missing attribution are rejected. Codex's own reviewer requests arrive at this local provider with the task's Claude model and are answered by Claude (see below); nothing is routed to OpenAI. Every Claude run loads only your user-level Claude settings (`--setting-sources user`), so a repository's `.claude/settings*.json` cannot change credentials, endpoints or permissions, and a run whose start-up event does not report `apiKeySource: none` with the selected model is stopped. This routing guarantee is not a network firewall preventing an explicitly requested shell command from contacting another service.
+
+## What you see while Claude works
+
+- Claude's thinking streams live into Codex's status line and is kept in the transcript as a **Thinking** quote (Claude Code's `--thinking-display summarized`; a model may not think on simple steps).
+- Each tool call appears in a running list, e.g. `**Bash** npm test`, `**Read** src/app.ts`, `[Review API] **Grep** TODO` for a subagent, and `Blocked by permissions: …` when a check stops one. The list names the requested call; Claude's native tools cannot appear as Codex's own "Ran command" rows.
+- Claude's interim notes appear as progress text. After the final answer, Codex folds all of this under "Worked for …".
+- Real `response.in_progress` events every 10 seconds keep Codex's 300-second idle timeout from dropping long silent steps.
 
 ## Tools and permissions
 
 - Codex's permission picker selects Claude's permission mode for native tools and native Agent subagents:
-  - **Ask for approval** runs Claude's `manual` mode. Each Claude permission prompt appears as a Codex question (Allow / Deny, or a free-form reply that Claude receives as the reason for the denial). The Claude profile enables `features.default_mode_request_user_input` for this. Without a way to ask, prompts are denied.
+  - **Ask for approval** runs Claude's `manual` mode. Each Claude permission prompt appears as a Codex question with the full request (the whole Bash command, or every input field for other tools): Allow, Deny, or a free-form reply that Claude receives as the reason for the denial. A request longer than 4,000 characters is denied rather than shown truncated. A question waits up to an hour. The Claude profile enables `features.default_mode_request_user_input` for this. Without a way to ask, prompts are denied. Stopping a task while a question is open ends that Claude run, and your next message starts fresh.
   - **Approve for me** runs Claude's `auto` mode: Claude's classifier approves or blocks each action. When Codex reviews a forwarded browser or task tool call, the adapter answers that review with a tool-less call to the task's Claude model.
   - **Full access** runs Claude's `bypassPermissions` mode with no permission checks.
   - Read-only side chats always use `auto` with Read/Glob/Grep only.
-- Codex's OS sandbox does not contain native Claude tools. Turns with the Codex relay run Claude in normal mode with hooks disabled and the relay as the only MCP server, so your Claude Code settings and plugins load. Claude's `--restricted` mode is not used: it strips Bash, WebFetch and Workflow and refuses bypass. Turns without the relay use `--safe-mode`. Read-only tasks use only Read/Glob/Grep, without browser access or native subagents.
+- Codex's OS sandbox does not contain native Claude tools. Turns with the Codex relay run Claude in normal mode with hooks disabled and the relay as the only MCP server; your user-level Claude Code settings and plugins load, repository settings do not. Claude's `--restricted` mode is not used: it strips Bash, WebFetch and Workflow and refuses bypass. Turns without the relay use `--safe-mode`. Read-only tasks use only Read/Glob/Grep, without browser access or native subagents.
+- Claude cannot take new input mid-run. A message you send while Claude waits on a Codex tool is kept for Claude's next turn, and a note says so.
 - The relay exposes `cua_repl.js`/`js_reset` and task `list_threads`, `read_thread`, `wait_threads`, and `send_message_to_thread` when the host provides them. Other Codex connectors and task-management tools are not currently forwarded.
 - Forwarded tools execute through the official Codex core and its permission checks. Host approvals may still require user input.
 - Messages can start work only in a local Claude-mode task already using the same selected model. Remote or differently modeled targets are refused. Reading and waiting do not start inference.
