@@ -221,7 +221,6 @@ class NativeRuntime:
                     customization = ['--restricted', '--disable-slash-commands',
                         '--settings', json.dumps({'disableAllHooks': True, 'autoMemoryEnabled': False}),
                         '--mcp-config', json.dumps(config), '--system-prompt-snapshot', 'off']
-                    emit('Codex browser tools are available through Claude MCP; Claude owns their permissions.')
                 else:
                     emit('Codex browser tools are unavailable for this task; native Claude tools remain available.')
             cmd = [str(CLAUDE), *customization, '--strict-mcp-config',
@@ -254,7 +253,6 @@ class NativeRuntime:
             process.stdin.write(json.dumps(framed or payload) + ('\n' if framed else ''))
             process.stdin.close()
             result = None
-            emit('Claude Code is running ' + MODELS[model][0] + ' at ' + effort + ' with native tools and Claude automatic permissions.')
             while True:
                 if cancelled():
                     self.cancel(thread_id)
@@ -276,8 +274,6 @@ class NativeRuntime:
                         for b in blocks:
                             if b.get('type') == 'text' and b.get('text'):
                                 emit(b['text'])
-                        for call in calls:
-                            emit('Claude Code is using ' + str(call.get('name', 'a native tool')) + '.')
                 elif event.get('type') == 'result':
                     result = event
             process.wait(timeout=10)
