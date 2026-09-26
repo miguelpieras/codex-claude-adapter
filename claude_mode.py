@@ -26,6 +26,11 @@ import app_icon
 ROOT = Path(__file__).resolve().parent
 HOME = Path.home() / '.codex'
 DIRECTORY = Path.home() / '.codex-claude'
+CONTEXT_WINDOW = 1_000_000
+# Profile settings the adapter owns. Codex memories run on an OpenAI model, which Claude
+# mode never uses; the question tool shows Claude permission prompts.
+PROFILE = {'features.default_mode_request_user_input': True, 'features.memories': False,
+           'memories.generate_memories': False, 'memories.use_memories': False}
 
 
 def private_directory(path):
@@ -98,6 +103,9 @@ def prepare(directory=DIRECTORY):
     for model in data['models']:
         model['input_modalities'] = ['text', 'image']
         model['supports_image_detail_original'] = True
+        # Claude's real window (Claude Code reports 1M for Opus 5.5 and Fable 5.1). Claude Code
+        # compacts its own session; a smaller advertised window only made Codex compact needlessly.
+        model['context_window'] = model['max_context_window'] = CONTEXT_WINDOW
         model['base_instructions'] = ('You are Claude using local Claude Code. Use native tools and native '
             'Agent subagents. Explicitly exposed Codex browser and task coordination MCP tools are available. '
             'Do not use an OpenAI model or API or an Anthropic API key. Respect the supplied permissions.')
@@ -118,8 +126,8 @@ def configure(home, state):
             'approval_policy="on-request"\napprovals_reviewer="user"\nsandbox_mode="workspace-write"\n'
             'web_search="disabled"\nmodel_catalog_json=' + json.dumps(str(home / 'claude-models.json')) + '\n'
             '\n[analytics]\nenabled=false\n'
-            # Lets the adapter show Claude permission prompts as Codex questions.
-            '\n[features]\ndefault_mode_request_user_input=true\n')
+            '\n[features]\ndefault_mode_request_user_input=true\nmemories=false\n'
+            '\n[memories]\ngenerate_memories=false\nuse_memories=false\n')
         for plugin in ('codex-app-tools', 'unified-computer-use', 'browser', 'chrome'):
             existing += '\n[plugins.' + json.dumps(plugin + '@openai-bundled') + ']\nenabled=true\n'
     # Provider configuration is at the end of the generated file. App writes
@@ -161,8 +169,8 @@ def write_provider(home, provider):
                     'value': None, 'mergeStrategy': 'replace'})
             await core.call('config/value/write', {'keyPath': 'model_providers.' + PROVIDER,
                 'value': provider, 'mergeStrategy': 'replace'})
-            await core.call('config/value/write', {'keyPath': 'features.default_mode_request_user_input',
-                'value': True, 'mergeStrategy': 'replace'})
+            for key, value in PROFILE.items():
+                await core.call('config/value/write', {'keyPath': key, 'value': value, 'mergeStrategy': 'replace'})
         finally:
             process.stdin.close()
             await asyncio.wait_for(process.wait(), 15)

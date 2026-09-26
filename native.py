@@ -32,6 +32,11 @@ LIVE = {'command': 'Running', 'read': 'Reading', 'edit': 'Editing', 'search': 'S
         'web': 'Searching the web for', 'fetch': 'Fetching', 'agent': 'Starting agent'}
 
 
+def session_marker(session_id):
+    """Left in Codex's compacted history so the next turn resumes the same Claude session."""
+    return '[claude-session:' + str(session_id) + ']'
+
+
 def short(text, limit=80):
     """First line of a tool input, trimmed for one-line display."""
     lines = str(text).strip().splitlines() or ['']
@@ -308,6 +313,13 @@ class NativeRuntime:
                       and state.get('model', MODEL) == model
                       and isinstance(inputs, list) and prefix > 0 and len(inputs) > prefix
                       and digest(inputs[:prefix]) == state.get('input_digest'))
+            if (state.get('status') == 'completed' and state.get('cwd') == binding['cwd']
+                    and state.get('model', MODEL) == model and isinstance(inputs, list)):
+                # Codex compacted its history: continue the same Claude session after the marker.
+                marker = session_marker(state.get('session_id'))
+                at = max((i for i, item in enumerate(inputs) if marker in json.dumps(item)), default=None)
+                if at is not None and len(inputs) > at + 1 and (not resume or at + 1 > prefix):
+                    resume, prefix = True, at + 1
             session_id = state['session_id'] if resume else str(uuid.uuid4())
             # Codex replays the thinking and progress items streamed below. Reasoning and
             # quoted thinking carry nothing Claude should reread; a resumed Claude session
@@ -383,6 +395,9 @@ class NativeRuntime:
             denials = []
             labels = {}  # tool_use_id -> short label, to name blocked calls
             streamed = False  # main-thread thinking already delivered as live deltas
+            # Codex treats reported input tokens as the context in use. Report Claude's last main
+            # API call, not the whole turn's sum (which made Codex compact needlessly).
+            context, output = None, 0
             burst = Tally()  # main-thread tool calls since Claude last wrote or thought
             agents = {}  # Agent tool_use_id -> [description, Tally of that subagent's calls]
             # Claude sends one content block per event. The latest main-thread text is
@@ -426,7 +441,14 @@ class NativeRuntime:
                         raise ValueError('Claude Code did not start on your subscription login with ' + model +
                                          ' (apiKeySource=' + str(event.get('apiKeySource')) + '). Nothing was sent to a fallback.')
                 elif kind == 'stream_event' and main:
-                    delta = (event.get('event') or {}).get('delta') or {}
+                    inner = event.get('event') or {}
+                    if inner.get('type') == 'message_start':
+                        used = (inner.get('message') or {}).get('usage') or {}
+                        context = {k: used.get(k, 0) for k in
+                                   ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')}
+                    elif inner.get('type') == 'message_delta':
+                        output = (inner.get('usage') or {}).get('output_tokens', output)
+                    delta = inner.get('delta') or {}
                     if delta.get('type') == 'thinking_delta' and delta.get('thinking'):
                         flush()
                         close_burst()
@@ -488,7 +510,8 @@ class NativeRuntime:
                 flush()  # interim text from before a background-agent follow-up
             if denials:
                 final += '\n\nClaude Code denied ' + str(len(denials)) + ' tool permission request(s). Those actions were not approved.'
-            state.update(status='completed', result=final, usage=result.get('usage', {}))
+            usage = {**context, 'output_tokens': output} if context else result.get('usage', {})
+            state.update(status='completed', result=final, usage=usage)
             atomic_json(path, state)
             return final, state['usage']
         except BaseException:

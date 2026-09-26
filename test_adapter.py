@@ -36,7 +36,9 @@ print(json.dumps({'type':'system','subtype':'init','model':model,'apiKeySource':
 final='CLAUDE_FIXTURE history='+str('HISTORY_123' in json.dumps(request))
 print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','name':'Read','id':'tool_1','input':{'file_path':'fixture.txt'}}]}}),flush=True)
 if 'STREAM' in json.dumps(request):
- for e in [{'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':'Plan: '}},'parent_tool_use_id':None},
+ for e in [{'type':'stream_event','event':{'type':'message_start','message':{'usage':{'input_tokens':5,'cache_read_input_tokens':40000,'cache_creation_input_tokens':100}}},'parent_tool_use_id':None},
+  {'type':'stream_event','event':{'type':'message_delta','delta':{'stop_reason':'end_turn'},'usage':{'output_tokens':7}},'parent_tool_use_id':None},
+  {'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':'Plan: '}},'parent_tool_use_id':None},
   {'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':'read files'}},'parent_tool_use_id':None},
   {'type':'assistant','message':{'content':[{'type':'thinking','thinking':'Plan: read files'}]},'parent_tool_use_id':None},
   {'type':'assistant','message':{'content':[{'type':'text','text':'Looking around.'}]},'parent_tool_use_id':None},
@@ -170,8 +172,11 @@ class NativeTests(unittest.TestCase):
 
     def test_progress_shows_thinking_actions_and_interim_text_once(self):
         seen = []
-        self.runtime.infer(self.thread, self.request('STREAM'), lambda text, kind='message': seen.append((kind, text)),
-                           lambda: False)
+        _, usage = self.runtime.infer(self.thread, self.request('STREAM'),
+                                      lambda text, kind='message': seen.append((kind, text)), lambda: False)
+        # Codex reads input tokens as context in use: the last API call, never the turn's sum.
+        self.assertEqual(usage, {'input_tokens': 5, 'cache_read_input_tokens': 40000,
+                                 'cache_creation_input_tokens': 100, 'output_tokens': 7})
         self.assertEqual(seen, [
             ('status', 'Reading fixture.txt'),       # live line while tools run
             ('message', 'Read `fixture.txt`'),       # one compact line per burst of tool calls
@@ -207,6 +212,18 @@ class NativeTests(unittest.TestCase):
             tally.add(*call)
         self.assertEqual(tally.summary(), 'Read 2 files, ran 2 searches, ran `npm test`, '
                                           'started agent **Audit billing**, used TodoWrite')
+
+    def test_turn_after_codex_compaction_resumes_the_claude_session(self):
+        self.run_turn(self.thread, self.request('first'))
+        session = json.loads((self.runtime.directory / (self.thread + '.json')).read_text())['session_id']
+        compacted = {**self.request('x'), 'input': [  # Codex rebuilt its history: no digest match
+            {'role': 'user', 'content': 'first (retained by Codex)'},
+            {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'summary ' + native.session_marker(session)}]},
+            {'role': 'user', 'content': 'after compaction'}]}
+        self.run_turn(self.thread, compacted)
+        call = json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(call['args'][call['args'].index('--resume') + 1], session)
+        self.assertEqual(call['request']['input'], [{'role': 'user', 'content': 'after compaction'}])
 
     def test_run_not_on_subscription_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'apiKeySource=ANTHROPIC_API_KEY'):

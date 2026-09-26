@@ -80,6 +80,22 @@ def binding_for(home, tid, model, metadata):
                 permission=permission)
 
 
+def compaction_note(home, directory, tid, model, metadata):
+    """Codex compacting a task's history. Claude keeps the full context in its own session,
+    so answer without any model call and leave a marker that resumes that session."""
+    if metadata.get('request_kind') != 'compaction':
+        return None
+    if model not in native.MODELS or metadata.get('thread_id') != tid:
+        raise ValueError('Compaction request does not match this Claude task; no fallback.')
+    row = task_record(home, tid)
+    if not row or row['model_provider'] != PROVIDER:
+        raise ValueError('Compaction request does not belong to a Claude-mode task.')
+    path = Path(directory) / (tid + '.json')
+    session = (json.loads(path.read_text()) if path.exists() else {}).get('session_id')
+    return ("Claude Code keeps this task's full context in its own session; only Codex's copy of the "
+            'history was compacted.' + (' ' + native.session_marker(session) if session else ''))
+
+
 def review_for(home, model, metadata, headers):
     """Codex's "Approve for me" reviewer, answered by Claude for a Claude-mode task."""
     if headers.get('x-openai-subagent') != 'guardian' or metadata.get('subagent_kind') != 'guardian':
@@ -315,6 +331,14 @@ class ServiceHandler(Handler):
             tid = self.headers.get('thread-id', '')
             uuid.UUID(tid)
             metadata = json.loads((request.get('client_metadata') or {}).get('x-codex-turn-metadata') or '{}')
+            note = compaction_note(self.server.home, self.server.native.directory, tid, request.get('model'), metadata)
+            if note is not None:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                Stream(self, request['model']).finish(note, {})
+                return
             review_cwd = review_for(self.server.home, request.get('model'), metadata, self.headers)
             if review_cwd:
                 self.send_response(200)

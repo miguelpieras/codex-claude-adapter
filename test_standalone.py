@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import time
+import tomllib
 import threading
 import unittest
 import urllib.error
@@ -67,6 +68,45 @@ class FailClosedTests(unittest.TestCase):
 
     def test_actual_attribution_must_match(self):
         self.assertEqual(self.request(metadata={**self.metadata, 'model': 'gpt-6-astra'}), 400)
+
+
+class CompactionTests(unittest.TestCase):
+    def test_compaction_is_answered_without_a_model_and_names_the_session(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            home, tid = Path(temporary), str(uuid.uuid4())
+            with closing(sqlite3.connect(home / 'state_5.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, model TEXT, model_provider TEXT)')
+                db.execute('INSERT INTO threads VALUES (?, ?, ?, ?)', (tid, str(home), native.MODEL, service.PROVIDER))
+                db.commit()
+            server = service.service(home / 'sessions', home=home)
+            native.atomic_json(server.native.directory / (tid + '.json'), {'session_id': 'S1', 'status': 'completed'})
+            server.native.infer = Mock(side_effect=AssertionError('no model call'))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                # Codex's compaction metadata carries no model: this used to fail attribution.
+                meta = {'thread_id': tid, 'turn_id': str(uuid.uuid4()), 'request_kind': 'compaction',
+                        'sandbox_mode': 'workspace-write', 'compaction': {'trigger': 'auto', 'reason': 'context_limit'}}
+                data = {'model': native.MODEL, 'input': [], 'client_metadata': {'x-codex-turn-metadata': json.dumps(meta)}}
+                request = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/v1/responses',
+                    data=json.dumps(data).encode(), headers={'Content-Type': 'application/json', 'thread-id': tid,
+                                                             'X-Local-Claude-Token': server.token})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    events = [json.loads(line[6:]) for line in response.read().decode().splitlines() if line.startswith('data: ')]
+                done = next(e for e in events if e['type'] == 'response.completed')['response']
+                self.assertIn(native.session_marker('S1'), done['output'][-1]['content'][0]['text'])
+                server.native.infer.assert_not_called()
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_new_profile_turns_off_codex_memories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            claude_mode.configure(home, {'port': 1234, 'token': 'x' * 40})
+            config = tomllib.loads((home / 'config.toml').read_text())
+            self.assertEqual(config['features'], {'default_mode_request_user_input': True, 'memories': False})
+            self.assertEqual(config['memories'], {'generate_memories': False, 'use_memories': False})
+            self.assertEqual(set(claude_mode.PROFILE), {'features.default_mode_request_user_input', 'features.memories',
+                                                        'memories.generate_memories', 'memories.use_memories'})
 
 
 class ConversionTests(unittest.TestCase):
