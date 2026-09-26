@@ -2,6 +2,8 @@
 
 September 25, 2026: macOS Codex desktop build 10954, bundled Codex CLI 0.155.0-alpha.16.4, Claude Code 2.1.282.
 
+September 26 update: desktop 26.924.20706 (build 11431) moved its bundled core to `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`. Discovery now supports that signed executable and the older layout. Launch validation also runs when the Claude service is already healthy, preventing the former attempt to execute `None`. All 39 tests passed against bundled CLI 0.158.0-alpha.2, including fixture-based provider, effort, side-chat, parallel-task, and rollback integration. The installed launcher was opened against the updated app; this update check did not repeat the subscription-backed tool smoke below.
+
 **Result: separate Claude desktop mode works with the official process chain. Real Claude task coordination and the in-app browser passed.** Regular Codex stays open with its original provider and tasks. The user accepted separate modes rather than a mixed GPT/Claude provider dropdown.
 
 ## Architecture

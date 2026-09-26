@@ -19,9 +19,16 @@ def find_app():
                 continue
             executable = info.get('CFBundleExecutable', '')
             app = path / 'Contents/MacOS' / executable
-            codex = path / 'Contents/Resources/codex'
-            if executable and app.is_file() and codex.is_file():
-                return app.resolve(), codex.resolve()
+            # Recent desktop builds package the signed CLI as a nested app.
+            # Match the desktop's own executable, retaining the older layout.
+            cli_candidates = [
+                path / 'Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+                path / 'Contents/Resources/codex',
+            ]
+            if executable and app.is_file():
+                for codex in cli_candidates:
+                    if codex.is_file():
+                        return app.resolve(), codex.resolve()
         except (OSError, ValueError, plistlib.InvalidFileException):
             continue
     return None, None
@@ -41,5 +48,5 @@ CLAUDE = find_claude()
 
 
 def require_codex():
-    if APP is None or CODEX is None:
-        raise RuntimeError('Codex desktop was not found. Set CODEX_ADAPTER_APP to its .app path. The ordinary ChatGPT app is not supported.')
+    if APP is None or CODEX is None or not APP.is_file() or not CODEX.is_file():
+        raise RuntimeError('Codex desktop or its bundled CLI was not found. If Codex just updated, the adapter may need an update. Set CODEX_ADAPTER_APP to the Codex .app path if it moved. The ordinary ChatGPT app is not supported.')

@@ -42,6 +42,7 @@ def owned(directory):
 
 
 def app_running(directory):
+    require_codex()
     result = subprocess.run(['/bin/ps', '-axo', 'args='], capture_output=True, text=True, check=True)
     target = str(APP) + ' --user-data-dir=' + str(directory / 'desktop')
     return any(line.strip() == target or line.strip().startswith(target + ' ')
@@ -139,6 +140,7 @@ def configure(home, state):
 
 
 def write_provider(home, provider):
+    require_codex()
     async def update():
         env = {k: v for k, v in os.environ.items() if k != 'CODEX_CLI_PATH'}
         env['CODEX_HOME'] = str(home)
@@ -213,6 +215,9 @@ def start(directory=DIRECTORY):
 
 
 def launch(directory=DIRECTORY):
+    # A healthy, pre-update service does not prove the installed app still
+    # exists at a supported path. Validate before start() can return early.
+    require_codex()
     start(directory)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('CODEX_', 'OPENAI_', 'ANTHROPIC_'))}
     env.update(CODEX_HOME=str(directory / 'home'), CODEX_ELECTRON_USER_DATA_PATH=str(directory / 'desktop'))
@@ -253,6 +258,7 @@ def remove(directory=DIRECTORY, *, delete_history=False):
 
 
 def standard(directory=DIRECTORY):
+    require_codex()
     import manage
     env = {k: v for k, v in os.environ.items() if not k.startswith(('CODEX_', 'OPENAI_', 'ANTHROPIC_'))}
     if manage.candidates(HOME):

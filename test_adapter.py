@@ -267,7 +267,7 @@ class ProtocolTests(unittest.TestCase):
                 (home / 'config.toml').write_text(config)
                 env = {k: v for k, v in os.environ.items() if not k.startswith(('OPENAI_', 'ANTHROPIC_', 'CLAUDE_', 'CODEX_'))}
                 env['CODEX_HOME'] = str(home)
-                env['CODEX_ADAPTER_APP'] = str(adapter.CODEX.parents[2])
+                env['CODEX_ADAPTER_APP'] = str(paths.APP.parents[2])
                 code = ('import sys,asyncio;sys.path.insert(0,' + repr(str(adapter.ROOT)) + ');'
                     'import adapter,native;from pathlib import Path;'
                     'adapter.RUNTIME=Path(' + repr(str(runtime)) + ');'
@@ -383,6 +383,14 @@ class PackagingTests(unittest.TestCase):
                 self.assertEqual(paths.find_app(), (None, None))
                 info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'com.openai.codex', 'CFBundleExecutable': 'Example'}))
                 self.assertEqual(paths.find_app()[1], (root / 'Contents/Resources/codex').resolve())
+                nested = root / 'Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
+                nested.parent.mkdir(parents=True)
+                nested.touch()
+                self.assertEqual(paths.find_app(), ((root / 'Contents/MacOS/Example').resolve(), nested.resolve()))
+                (root / 'Contents/Resources/codex').unlink()
+                self.assertEqual(paths.find_app()[1], nested.resolve())
+                nested.unlink()
+                self.assertEqual(paths.find_app(), (None, None))
 
     def test_uninstall_preserves_checkout(self):
         with tempfile.TemporaryDirectory() as temp:

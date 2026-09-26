@@ -250,6 +250,14 @@ class RelayTests(unittest.TestCase):
             self.server.browser.close(token)
 
 class RemovalTests(unittest.TestCase):
+    def test_missing_updated_app_fails_before_reusing_service(self):
+        with patch.object(claude_mode, 'require_codex', side_effect=RuntimeError('bundled CLI missing')), \
+             patch.object(claude_mode, 'start') as start, patch.object(claude_mode.subprocess, 'Popen') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'bundled CLI missing'):
+                claude_mode.launch()
+            start.assert_not_called()
+            launch.assert_not_called()
+
     def test_unrelated_directory_and_running_window_are_preserved(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as tmp:
             directory = Path(tmp) / 'owned'
@@ -279,7 +287,7 @@ class RemovalTests(unittest.TestCase):
                 self.assertFalse(directory.exists())
 
     def test_standard_launch_clears_adapter_environment(self):
-        with patch('manage.candidates', return_value=[]), patch.object(claude_mode, 'control'), patch.object(claude_mode.subprocess, 'Popen') as launch:
+        with patch.object(claude_mode, 'require_codex'), patch('manage.candidates', return_value=[]), patch.object(claude_mode, 'control'), patch.object(claude_mode.subprocess, 'Popen') as launch:
             with patch.dict(os.environ, {'CODEX_HOME': '/tmp/claude', 'CODEX_CLI_PATH': '/tmp/wrapper', 'CODEX_ELECTRON_USER_DATA_PATH': '/tmp/profile'}):
                 claude_mode.standard()
             environment = launch.call_args.kwargs['env']
