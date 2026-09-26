@@ -134,7 +134,9 @@ class NativeBrowserTests(unittest.TestCase):
         self.runtime.browser = browser
         self.run_turn(self.thread, self.request())
         call = json.loads((self.root / 'calls.jsonl').read_text())
-        self.assertIn('--restricted', call['args'])
+        # --restricted would strip Bash/WebFetch/Workflow; hooks stay off, MCP stays strict.
+        self.assertNotIn('--restricted', call['args'])
+        self.assertIn('disableAllHooks', call['args'][call['args'].index('--settings') + 1])
         self.assertIn('--strict-mcp-config', call['args'])
         self.assertNotIn('--safe-mode', call['args'])
         self.assertNotIn('--allowedTools', call['args'])

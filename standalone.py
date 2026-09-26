@@ -46,12 +46,13 @@ def binding_for(home, tid, model, metadata):
         raise ValueError('Mismatched task/model attribution; no fallback.')
     uuid.UUID(tid)
     uuid.UUID(metadata.get('turn_id', ''))
-    if metadata.get('auto_review_enabled') is not False or metadata.get('node_repl_auto_review_required') is not False:
-        raise ValueError('Claude mode does not support "Approve for me": it hands approvals to a Codex reviewer model. '
-                         'Choose "Ask for approval" (Claude Auto mode) or "Full access" (Claude bypass mode).')
     mode = metadata.get('sandbox_mode')
-    if mode not in ('read-only', 'workspace-write', 'danger-full-access'):
+    if mode not in ('read-only', 'workspace-write', 'danger-full-access') or not isinstance(metadata.get('auto_review_enabled'), bool):
         raise ValueError('Missing or unsupported host permissions.')
+    # Codex picker -> Claude permission mode. "Approve for me" reviews of
+    # forwarded host tools come back here as guardian requests (see review_for).
+    permission = ('auto' if mode == 'read-only' else 'bypassPermissions' if mode == 'danger-full-access'
+                  else 'auto' if metadata['auto_review_enabled'] else 'manual')
     row = task_record(home, tid)
     if row:
         if row['model_provider'] != PROVIDER:
@@ -74,7 +75,19 @@ def binding_for(home, tid, model, metadata):
     effort = metadata.get('reasoning_effort')
     native.claude_effort(model, effort)
     return dict(cwd=str(Path(cwd).resolve(strict=True)), readonly=mode == 'read-only', model=model, effort=effort,
-                full_access=mode == 'danger-full-access')
+                permission=permission)
+
+
+def review_for(home, model, metadata, headers):
+    """Codex's "Approve for me" reviewer, answered by Claude for a Claude-mode task."""
+    if headers.get('x-openai-subagent') != 'guardian' or metadata.get('subagent_kind') != 'guardian':
+        return None
+    if model not in native.MODELS or metadata.get('model') != model:
+        raise ValueError('Reviewer request must use the task\'s Claude model; no fallback.')
+    parent = task_record(home, metadata.get('parent_thread_id')) if isinstance(metadata.get('parent_thread_id'), str) else None
+    if not parent or parent['model_provider'] != PROVIDER:
+        raise ValueError('Reviewer request does not belong to a Claude-mode task.')
+    return str(Path(parent['cwd']).resolve(strict=True))
 
 
 def descriptors(tools, namespace=None):
@@ -120,6 +133,9 @@ class Turn:
     def __init__(self, tid, request, metadata):
         self.tid, self.model, self.metadata = tid, request['model'], metadata
         self.tools = descriptors(request.get('tools', []))
+        # Codex's question tool; used only to show Claude permission prompts.
+        self.ask = any(t.get('type') == 'function' and t.get('name') == 'request_user_input'
+                       for t in request.get('tools', []))
         self.events, self.outputs = queue.Queue(), queue.Queue()
         self.stopped = threading.Event()
         self.http_lock, self.tool_lock = threading.Lock(), threading.Lock()
@@ -148,6 +164,11 @@ class Relay(BrowserBridge):
                   'inputSchema': tool['parameters'],
                   'annotations': {'readOnlyHint': False, 'openWorldHint': True}}
                  for name, tool in turn.tools.items()]
+        if turn.ask and (self.server.native.bindings.get(thread_id) or {}).get('permission') == 'manual':
+            tools.append({'name': native.APPROVAL,
+                'description': 'Claude Code permission prompt, answered by the user in Codex.',
+                'inputSchema': {'type': 'object', 'required': ['tool_name', 'input'], 'properties': {
+                    'tool_name': {'type': 'string'}, 'input': {'type': 'object'}, 'tool_use_id': {'type': 'string'}}}})
         with self.guard:
             self.sessions[token] = {'thread': thread_id, 'turn': turn, 'tools': tools}
         return token, {'mcpServers': {'codex_browser': {
@@ -160,6 +181,8 @@ class Relay(BrowserBridge):
         if not session:
             raise ValueError('Expired native turn.')
         turn = session['turn']
+        if name == native.APPROVAL and any(t['name'] == name for t in session['tools']):
+            return self.approve(turn, arguments)
         if name not in turn.tools or not isinstance(arguments, dict):
             raise ValueError('Unavailable host tool or invalid arguments.')
         # One outstanding host call per task; separate tasks run concurrently.
@@ -181,21 +204,55 @@ class Relay(BrowserBridge):
                     'name': tool['name'], 'arguments': json.dumps(arguments)}
             if tool.get('namespace'):
                 item['namespace'] = tool['namespace']
-            turn.pending = item['call_id']
-            turn.events.put(('call', item))
-            deadline = time.monotonic() + 120
-            while not turn.stopped.is_set() and time.monotonic() < deadline:
-                try:
-                    output = turn.outputs.get(timeout=.25)
-                    turn.pending = None
-                    result = mcp_result(output)
-                    self.server.observations.append({'tool': name, 'returned': True,
-                        'content_types': [v.get('type') for v in result.get('content', [])]})
-                    return result
-                except queue.Empty:
-                    pass
-            turn.stopped.set()
-            raise ValueError('Host continuation missing or cancelled; no retry.')
+            result = mcp_result(self.forward(turn, item, 120))
+            self.server.observations.append({'tool': name, 'returned': True,
+                'content_types': [v.get('type') for v in result.get('content', [])]})
+            return result
+
+    def forward(self, turn, item, seconds):
+        """Hand one function call to Codex and wait for its exact result. Caller holds tool_lock."""
+        turn.pending = item['call_id']
+        turn.events.put(('call', item))
+        deadline = time.monotonic() + seconds
+        while not turn.stopped.is_set() and time.monotonic() < deadline:
+            try:
+                output = turn.outputs.get(timeout=.25)
+                turn.pending = None
+                return output
+            except queue.Empty:
+                pass
+        turn.stopped.set()
+        raise ValueError('Host continuation missing or cancelled; no retry.')
+
+    def approve(self, turn, arguments):
+        """Show one Claude permission prompt as a Codex question; the user's answer decides."""
+        tool_name, tool_input = arguments.get('tool_name'), arguments.get('input')
+        if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
+            raise ValueError('Invalid Claude permission request.')
+        detail = next((tool_input[k] for k in ('command', 'file_path', 'url', 'pattern')
+                       if isinstance(tool_input.get(k), str)), None) or json.dumps(tool_input)
+        question = 'Allow Claude to use ' + tool_name + ': ' + detail
+        question = question if len(question) <= 300 else question[:297] + '...'
+        questions = [{'id': 'claude_permission', 'header': 'Claude', 'question': question, 'options': [
+            {'label': 'Allow', 'description': 'Let Claude run this action once.'},
+            {'label': 'Deny', 'description': 'Block it; Claude continues without it.'}]}]
+        with turn.tool_lock:
+            if turn.stopped.is_set():
+                raise ValueError('Cancelled task.')
+            output = self.forward(turn, {'type': 'function_call', 'id': 'fc_' + uuid.uuid4().hex,
+                'call_id': 'call_' + uuid.uuid4().hex, 'status': 'completed',
+                'name': 'request_user_input', 'arguments': json.dumps({'questions': questions})}, 3600)
+        try:
+            answers = json.loads(output)['answers']['claude_permission']['answers']
+        except (ValueError, KeyError, TypeError):
+            reason = 'Codex could not ask the user (' + str(output)[:200] + '); the action was not approved.'
+            return {'content': [{'type': 'text', 'text': json.dumps({'behavior': 'deny', 'message': reason})}]}
+        if answers[:1] == ['Allow']:
+            decision = {'behavior': 'allow', 'updatedInput': tool_input}
+        else:
+            note = ' '.join(str(a) for a in answers if a != 'Deny')
+            decision = {'behavior': 'deny', 'message': 'The user denied this action' + (': ' + note if note else '.')}
+        return {'content': [{'type': 'text', 'text': json.dumps(decision)}]}
 
     def cancel(self, tid):
         if tid in self.server.turns:
@@ -240,6 +297,15 @@ class ServiceHandler(Handler):
             tid = self.headers.get('thread-id', '')
             uuid.UUID(tid)
             metadata = json.loads((request.get('client_metadata') or {}).get('x-codex-turn-metadata') or '{}')
+            review_cwd = review_for(self.server.home, request.get('model'), metadata, self.headers)
+            if review_cwd:
+                verdict, usage = self.server.native.review(request, review_cwd)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                Stream(self, request['model']).finish(verdict, usage)
+                return
             binding = binding_for(self.server.home, tid, request.get('model'), metadata)
             if not isinstance(request.get('input'), list) or request.get('previous_response_id'):
                 raise ValueError('Full task context is required.')

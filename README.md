@@ -48,18 +48,18 @@ The service checks that local Claude Code is authenticated with `claude.ai`, a f
 
 Main inference and native Agent subagents are pinned to the selected Claude model. Recorded parent and child transcripts have verified Opus 5.5; Fable's transcript verified Fable 5.1. Native automatic permission classification is controlled by Claude Code and may use another Anthropic model. It is not covered by the task-model pin.
 
-Unknown models, missing attribution, and requests requiring an OpenAI host approval reviewer are rejected. This routing guarantee is not a network firewall preventing an explicitly requested shell command from contacting another service.
+Unknown models and missing attribution are rejected. Codex's own reviewer requests arrive at this local provider with the task's Claude model and are answered by Claude (see below); nothing is routed to OpenAI. This routing guarantee is not a network firewall preventing an explicitly requested shell command from contacting another service.
 
 ## Tools and permissions
 
 - Codex's permission picker selects Claude's permission mode for native tools and native Agent subagents:
-  - **Ask for approval** runs Claude's `auto` mode: Claude's classifier approves or blocks each action. Interactive Claude approval prompts are unsupported; denials are reported.
-  - **Full access** runs Claude's `bypassPermissions` mode with no permission checks. Claude refuses bypass in its restricted mode, so these turns load your normal Claude Code settings and plugins; hooks stay disabled and the Codex relay stays the only MCP server.
-  - **Approve for me** is refused because it hands approvals to Codex's reviewer model.
+  - **Ask for approval** runs Claude's `manual` mode. Each Claude permission prompt appears as a Codex question (Allow / Deny, or a free-form reply that Claude receives as the reason for the denial). The Claude profile enables `features.default_mode_request_user_input` for this. Without a way to ask, prompts are denied.
+  - **Approve for me** runs Claude's `auto` mode: Claude's classifier approves or blocks each action. When Codex reviews a forwarded browser or task tool call, the adapter answers that review with a tool-less call to the task's Claude model.
+  - **Full access** runs Claude's `bypassPermissions` mode with no permission checks.
   - Read-only side chats always use `auto` with Read/Glob/Grep only.
-- Codex's OS sandbox does not contain native Claude tools. The runtime uses restricted settings, disables hooks/skills, and supplies only the configured relay MCP server. Read-only tasks use only Read/Glob/Grep, without browser access or native subagents.
+- Codex's OS sandbox does not contain native Claude tools. Turns with the Codex relay run Claude in normal mode with hooks disabled and the relay as the only MCP server, so your Claude Code settings and plugins load. Claude's `--restricted` mode is not used: it strips Bash, WebFetch and Workflow and refuses bypass. Turns without the relay use `--safe-mode`. Read-only tasks use only Read/Glob/Grep, without browser access or native subagents.
 - The relay exposes `cua_repl.js`/`js_reset` and task `list_threads`, `read_thread`, `wait_threads`, and `send_message_to_thread` when the host provides them. Other Codex connectors and task-management tools are not currently forwarded.
-- Forwarded tools execute through the official Codex core and its permission checks. Host approvals may still require user input. Required model-based review is refused instead of silently invoking an OpenAI reviewer or bypassing a policy.
+- Forwarded tools execute through the official Codex core and its permission checks. Host approvals may still require user input.
 - Messages can start work only in a local Claude-mode task already using the same selected model. Remote or differently modeled targets are refused. Reading and waiting do not start inference.
 - Separate Claude tasks can run concurrently. Native subagents within one task share that task's browser REPL and must coordinate tabs and variable names.
 - In-app browser access requires a desktop-owned task. Screenshot/image results reach Claude through the subscription session. Browser policies remain in force; a denial is not permission to switch to a private browser interface.

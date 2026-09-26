@@ -95,6 +95,11 @@ class BrowserBridge:
         with self.guard:
             self.sessions = {k: v for k, v in self.sessions.items() if v['thread'] != thread_id}
 
+    def tool_names(self, token):
+        with self.guard:
+            session = self.sessions.get(token)
+        return {t['name'] for t in session['tools']} if session else set()
+
     async def call(self, token, name, arguments):
         with self.guard:
             session = self.sessions.get(token)

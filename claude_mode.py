@@ -117,7 +117,9 @@ def configure(home, state):
             '\nmodel_reasoning_effort="medium"\n'
             'approval_policy="on-request"\napprovals_reviewer="user"\nsandbox_mode="workspace-write"\n'
             'web_search="disabled"\nmodel_catalog_json=' + json.dumps(str(home / 'claude-models.json')) + '\n'
-            '\n[analytics]\nenabled=false\n')
+            '\n[analytics]\nenabled=false\n'
+            # Lets the adapter show Claude permission prompts as Codex questions.
+            '\n[features]\ndefault_mode_request_user_input=true\n')
         for plugin in ('codex-app-tools', 'unified-computer-use', 'browser', 'chrome'):
             existing += '\n[plugins.' + json.dumps(plugin + '@openai-bundled') + ']\nenabled=true\n'
     # Provider configuration is at the end of the generated file. App writes
@@ -159,6 +161,8 @@ def write_provider(home, provider):
                     'value': None, 'mergeStrategy': 'replace'})
             await core.call('config/value/write', {'keyPath': 'model_providers.' + PROVIDER,
                 'value': provider, 'mergeStrategy': 'replace'})
+            await core.call('config/value/write', {'keyPath': 'features.default_mode_request_user_input',
+                'value': True, 'mergeStrategy': 'replace'})
         finally:
             process.stdin.close()
             await asyncio.wait_for(process.wait(), 15)

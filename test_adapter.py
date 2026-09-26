@@ -105,15 +105,21 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn('--bare', call['args'])
         self.assertNotIn('--dangerously-skip-permissions', call['args'])
 
-    def test_full_access_selects_bypass_mode_except_read_only(self):
-        self.runtime.bind(self.thread, self.root, full_access=True)
-        self.run_turn(self.thread, self.request('full'))
-        side = str(uuid.uuid4())
-        self.runtime.bind(side, self.root, readonly=True, full_access=True)
-        self.run_turn(side, self.request('side'))
-        modes = [v['args'][v['args'].index('--permission-mode') + 1]
-                 for v in map(json.loads, (self.root / 'calls.jsonl').read_text().splitlines())]
-        self.assertEqual(modes, ['bypassPermissions', 'auto'])
+    def test_permission_modes_and_read_only_side_chats(self):
+        threads = []
+        for permission in ('bypassPermissions', 'manual'):
+            threads.append(str(uuid.uuid4()))
+            self.runtime.bind(threads[-1], self.root, permission=permission)
+        threads.append(str(uuid.uuid4()))
+        self.runtime.bind(threads[-1], self.root, readonly=True, permission='bypassPermissions')
+        for tid in threads:
+            self.run_turn(tid, self.request(tid))
+        calls = [v['args'] for v in map(json.loads, (self.root / 'calls.jsonl').read_text().splitlines())]
+        self.assertEqual([a[a.index('--permission-mode') + 1] for a in calls], ['bypassPermissions', 'manual', 'auto'])
+        # Manual without a way to ask the user denies prompts instead of guessing.
+        self.assertTrue(all(a[a.index('--permission-prompts') + 1] == 'none' for a in calls))
+        with self.assertRaises(ValueError):
+            self.runtime.bind(self.thread, self.root, permission='dangerously-anything')
 
     def test_parallel_and_idempotent(self):
         other = str(uuid.uuid4())

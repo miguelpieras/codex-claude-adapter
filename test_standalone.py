@@ -1,5 +1,7 @@
+from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -58,9 +60,8 @@ class FailClosedTests(unittest.TestCase):
     def test_bad_token_never_calls_inference(self):
         self.assertEqual(self.request(token=False), 403)
 
-    def test_required_host_model_review_is_not_bypassed(self):
-        for key in ('auto_review_enabled', 'node_repl_auto_review_required'):
-            self.assertEqual(self.request(metadata={**self.metadata, key: True}), 400)
+    def test_missing_host_permissions_never_calls_inference(self):
+        self.assertEqual(self.request(metadata={k: v for k, v in self.metadata.items() if k != 'auto_review_enabled'}), 400)
         self.assertEqual(self.request(metadata={}), 400)
 
     def test_actual_attribution_must_match(self):
@@ -68,15 +69,35 @@ class FailClosedTests(unittest.TestCase):
 
 
 class ConversionTests(unittest.TestCase):
-    def test_full_access_picker_maps_to_bypass_binding(self):
+    def test_picker_maps_to_claude_permission_modes(self):
         with tempfile.TemporaryDirectory() as root:
             tid = str(uuid.uuid4())
             base = {'thread_id': tid, 'model': native.MODEL, 'turn_id': str(uuid.uuid4()),
-                    'auto_review_enabled': False, 'node_repl_auto_review_required': False,
-                    'workspaces': {root: {}}}
-            for mode, expected in (('danger-full-access', True), ('workspace-write', False), ('read-only', False)):
-                binding = service.binding_for(root, tid, native.MODEL, {**base, 'sandbox_mode': mode})
-                self.assertEqual(binding['full_access'], expected)
+                    'node_repl_auto_review_required': False, 'workspaces': {root: {}}}
+            for mode, review, expected in (('workspace-write', False, 'manual'),        # Ask for approval
+                                           ('workspace-write', True, 'auto'),           # Approve for me
+                                           ('danger-full-access', False, 'bypassPermissions'),  # Full access
+                                           ('read-only', True, 'auto')):
+                binding = service.binding_for(root, tid, native.MODEL,
+                                              {**base, 'sandbox_mode': mode, 'auto_review_enabled': review})
+                self.assertEqual(binding['permission'], expected)
+            with self.assertRaises(ValueError):
+                service.binding_for(root, tid, native.MODEL, {**base, 'sandbox_mode': 'workspace-write'})
+
+    def test_reviewer_requests_only_for_claude_mode_tasks(self):
+        with tempfile.TemporaryDirectory() as root:
+            parent = str(uuid.uuid4())
+            with closing(sqlite3.connect(Path(root) / 'state_5.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, model TEXT, model_provider TEXT)')
+                db.execute('INSERT INTO threads VALUES (?, ?, ?, ?)', (parent, root, native.MODEL, service.PROVIDER))
+                db.commit()
+            meta = {'subagent_kind': 'guardian', 'model': native.MODEL, 'parent_thread_id': parent}
+            guardian = {'x-openai-subagent': 'guardian'}
+            self.assertEqual(service.review_for(root, native.MODEL, meta, guardian), str(Path(root).resolve()))
+            self.assertIsNone(service.review_for(root, native.MODEL, meta, {}))
+            for bad in ({**meta, 'model': 'gpt-5.6-luna'}, {**meta, 'parent_thread_id': str(uuid.uuid4())}):
+                with self.assertRaises(ValueError):
+                    service.review_for(root, bad['model'], bad, guardian)
 
     def test_native_inline_images_are_framed_and_remote_urls_rejected(self):
         message = native.inline_image_message({'input': [{'type': 'input_image',
@@ -219,6 +240,31 @@ class RelayTests(unittest.TestCase):
         state = json.loads((self.server.native.directory / (self.tid + '.json')).read_text())
         self.assertEqual(state['input_count'], 2)
         self.assertEqual(state['input_digest'], native.digest(continuation['input']))
+
+    def test_manual_permission_prompt_becomes_codex_question(self):
+        decisions = []
+        def infer(tid, request, emit, cancelled, **kwargs):
+            token, _ = self.server.browser.open(tid, self.metadata, model=native.MODEL)
+            try:
+                self.assertIn(native.APPROVAL, self.server.browser.tool_names(token))
+                result = asyncio.run(self.server.browser.call(token, native.APPROVAL,
+                    {'tool_name': 'Bash', 'input': {'command': 'rm -rf build'}}))
+                decisions.append(json.loads(result['content'][0]['text']))
+                native.atomic_json(self.server.native.directory / (tid + '.json'),
+                    {'status': 'completed', 'result': 'done', 'usage': {}})
+                return 'done', {}
+            finally:
+                self.server.browser.close(token)
+        self.server.native.infer = infer
+        request = {**self.request, 'tools': [*self.request['tools'],
+            {'type': 'function', 'name': 'request_user_input', 'parameters': {'type': 'object'}}]}
+        first = self.post(request)
+        call = next(v for v in first['output'] if v['type'] == 'function_call')
+        self.assertEqual(call['name'], 'request_user_input')
+        self.assertIn('rm -rf build', json.loads(call['arguments'])['questions'][0]['question'])
+        self.post({**request, 'input': [call, {'type': 'function_call_output', 'call_id': call['call_id'],
+            'output': json.dumps({'answers': {'claude_permission': {'answers': ['Deny', 'use make clean']}}})}]})
+        self.assertEqual(decisions, [{'behavior': 'deny', 'message': 'The user denied this action: use make clean'}])
 
     def test_wrong_tool_result_cancels_instead_of_replaying(self):
         self.post(self.request)

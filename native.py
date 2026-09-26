@@ -15,6 +15,8 @@ MODEL = 'claude-opus-5-5'
 FABLE = 'claude-fable-5-1'
 MODELS = {MODEL: ('Claude Opus 5.5', 'medium'), FABLE: ('Claude Fable 5.1', 'high')}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+APPROVAL = 'claude_permission'  # relay MCP tool that answers Claude permission prompts
+PERMISSIONS = ('auto', 'manual', 'bypassPermissions')
 
 def claude_effort(model, effort=None):
     if model not in MODELS:
@@ -139,12 +141,14 @@ class NativeRuntime:
         self.system = system
         self.inline_images = inline_images
 
-    def bind(self, thread_id, cwd, *, readonly=False, model=MODEL, effort=None, full_access=False):
+    def bind(self, thread_id, cwd, *, readonly=False, model=MODEL, effort=None, permission='auto'):
         uuid.UUID(thread_id)
         cwd = str(Path(cwd).resolve(strict=True))
+        if permission not in PERMISSIONS:
+            raise ValueError('Unsupported Claude permission mode.')
         with self.guard:
             self.bindings[thread_id] = {'cwd': cwd, 'readonly': readonly, 'model': model, 'effort': effort,
-                                        'full_access': full_access and not readonly}
+                                        'permission': 'auto' if readonly else permission}
 
     def cancel(self, thread_id):
         if self.browser:
@@ -210,6 +214,9 @@ class NativeRuntime:
                        'continuation': bool(resume)}
             framed = inline_image_message(payload) if media else None
             customization = ['--safe-mode']
+            permission = binding['permission']
+            # Without a way to ask the user, anything that would prompt is denied.
+            prompts = ['--permission-prompts', 'none']
             if self.browser and not binding['readonly']:
                 try:
                     browser = self.browser.open(thread_id, browser_metadata, model=model)
@@ -217,19 +224,20 @@ class NativeRuntime:
                     browser = None
                 if browser:
                     browser_token, config = browser
-                    # Safe mode disables even explicit MCP. Restricted mode
-                    # ignores user/project settings; only this MCP is supplied.
-                    # Claude refuses bypassPermissions in restricted mode, so
-                    # Full access keeps hooks off and MCP strict without it.
-                    restricted = [] if binding['full_access'] else ['--restricted']
-                    customization = [*restricted, '--disable-slash-commands',
+                    # Safe mode disables even explicit MCP. Restricted mode is
+                    # not used: it strips Bash, WebFetch and Workflow unless
+                    # named, and refuses bypassPermissions. Hooks stay off and
+                    # this relay is the only MCP server.
+                    customization = ['--disable-slash-commands',
                         '--settings', json.dumps({'disableAllHooks': True, 'autoMemoryEnabled': False}),
                         '--mcp-config', json.dumps(config), '--system-prompt-snapshot', 'off']
+                    if permission == 'manual' and APPROVAL in self.browser.tool_names(browser_token):
+                        prompts = ['--permission-prompts', 'host',
+                                   '--permission-prompt-tool', 'mcp__codex_browser__' + APPROVAL]
                 else:
                     emit('Codex browser tools are unavailable for this task; native Claude tools remain available.')
             cmd = [str(CLAUDE), *customization, '--strict-mcp-config',
-                   '--permission-mode', 'bypassPermissions' if binding['full_access'] else 'auto',
-                   '--permission-prompts', 'none',
+                   '--permission-mode', permission, *prompts,
                    '--model', model, '--effort', effort, '--tools',
                    'Read,Glob,Grep' if binding['readonly'] else 'default',
                    '--append-system-prompt', self.system, '--output-format', 'stream-json',
@@ -319,3 +327,38 @@ class NativeRuntime:
                     self.running.pop(thread_id, None)
                 process.stdout.close()
             lock.release()
+
+    def review(self, request, cwd):
+        """Answer Codex's "Approve for me" reviewer with one tool-less Claude call."""
+        model = request.get('model')
+        effort = claude_effort(model, (request.get('reasoning') or {}).get('effort'))
+        effort = 'xhigh' if effort == 'ultracode' else effort
+        instructions, inputs = request.get('instructions'), request.get('input')
+        if not isinstance(instructions, str) or not isinstance(inputs, list):
+            raise ValueError('Invalid reviewer request.')
+        schema = ((request.get('text') or {}).get('format') or {}).get('schema')
+        transcript = []
+        for item in inputs:
+            if isinstance(item, dict) and item.get('type') == 'message':
+                parts = [p.get('text', '') for p in item.get('content', []) if isinstance(p, dict)]
+                transcript.append('[' + str(item.get('role')) + ']\n' + '\n'.join(parts))
+            else:
+                transcript.append(json.dumps(item))
+        check_auth(cwd)
+        cmd = [str(CLAUDE), '--safe-mode', '--strict-mcp-config', '--no-session-persistence',
+               '--permission-mode', 'auto', '--permission-prompts', 'none', '--model', model,
+               '--effort', effort, '--tools', '', '--system-prompt', instructions, '--output-format', 'json', '-p']
+        if schema:
+            cmd += ['--json-schema', json.dumps(schema)]
+        run = subprocess.run(cmd, input='\n\n'.join(transcript), cwd=cwd, env=environment(model),
+                             capture_output=True, text=True, timeout=600)
+        try:
+            result = json.loads(run.stdout)
+        except ValueError:
+            raise ValueError('Claude reviewer returned no result; the action was not approved.')
+        if run.returncode or result.get('is_error'):
+            raise ValueError(str(result.get('result', 'Claude reviewer failed.'))[:1000])
+        if set(result.get('modelUsage', {})) != {model}:
+            raise ValueError('Claude did not confirm exclusive ' + model + ' review inference. Refusing a silent model fallback.')
+        verdict = result.get('structured_output') if schema else None
+        return (json.dumps(verdict) if verdict is not None else result.get('result', '')), result.get('usage', {})
