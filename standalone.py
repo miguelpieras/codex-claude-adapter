@@ -48,7 +48,7 @@ def binding_for(home, tid, model, metadata):
     uuid.UUID(metadata.get('turn_id', ''))
     if metadata.get('auto_review_enabled') is not False or metadata.get('node_repl_auto_review_required') is not False:
         raise ValueError('Claude mode does not support "Approve for me": it hands approvals to a Codex reviewer model. '
-                         'Choose "Ask for approval" or "Full access"; Claude still runs in its own Auto mode.')
+                         'Choose "Ask for approval" (Claude Auto mode) or "Full access" (Claude bypass mode).')
     mode = metadata.get('sandbox_mode')
     if mode not in ('read-only', 'workspace-write', 'danger-full-access'):
         raise ValueError('Missing or unsupported host permissions.')
@@ -73,7 +73,8 @@ def binding_for(home, tid, model, metadata):
             raise ValueError('An ephemeral task must identify exactly one workspace.')
     effort = metadata.get('reasoning_effort')
     native.claude_effort(model, effort)
-    return dict(cwd=str(Path(cwd).resolve(strict=True)), readonly=mode == 'read-only', model=model, effort=effort)
+    return dict(cwd=str(Path(cwd).resolve(strict=True)), readonly=mode == 'read-only', model=model, effort=effort,
+                full_access=mode == 'danger-full-access')
 
 
 def descriptors(tools, namespace=None):

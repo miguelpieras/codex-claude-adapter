@@ -68,6 +68,16 @@ class FailClosedTests(unittest.TestCase):
 
 
 class ConversionTests(unittest.TestCase):
+    def test_full_access_picker_maps_to_bypass_binding(self):
+        with tempfile.TemporaryDirectory() as root:
+            tid = str(uuid.uuid4())
+            base = {'thread_id': tid, 'model': native.MODEL, 'turn_id': str(uuid.uuid4()),
+                    'auto_review_enabled': False, 'node_repl_auto_review_required': False,
+                    'workspaces': {root: {}}}
+            for mode, expected in (('danger-full-access', True), ('workspace-write', False), ('read-only', False)):
+                binding = service.binding_for(root, tid, native.MODEL, {**base, 'sandbox_mode': mode})
+                self.assertEqual(binding['full_access'], expected)
+
     def test_native_inline_images_are_framed_and_remote_urls_rejected(self):
         message = native.inline_image_message({'input': [{'type': 'input_image',
             'image_url': 'data:image/png;base64,YQ=='}]})

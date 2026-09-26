@@ -2,7 +2,7 @@
 
 Run **Claude Opus 5.5** and **Claude Fable 5.1** in a separate Codex desktop mode, using your authenticated local Claude Code subscription. Regular Codex keeps its normal settings, tasks, voice, and model picker.
 
-The standalone service leaves the official Codex app and its app-server process chain intact. Claude owns its native tools, automatic permissions, and native Agent subagents. Browser and selected task tools return through Codex's ordinary Responses tool loop.
+The standalone service leaves the official Codex app and its app-server process chain intact. Claude owns its native tools, permissions (Auto by default), and native Agent subagents. Browser and selected task tools return through Codex's ordinary Responses tool loop.
 
 **macOS, experimental.** The current desktop smoke passed real task list/read/wait/message calls, the in-app browser, and a native Opus subagent. Fable Ultra was verified as Claude `ultracode`. See [verification and boundaries](STANDALONE.md).
 
@@ -52,8 +52,11 @@ Unknown models, missing attribution, and requests requiring an OpenAI host appro
 
 ## Tools and permissions
 
-- Native Claude tools and native Agent subagents run in Claude's `auto` permission mode, without `--dangerously-skip-permissions`. Interactive Claude approval prompts are unsupported; denials are reported.
-- In Codex's permission picker, choose **Ask for approval** or **Full access**. Claude's own tools stay in Claude's Auto mode with either; the picker only changes how Codex handles forwarded browser and task tools. **Approve for me** is refused because it hands approvals to Codex's reviewer model.
+- Codex's permission picker selects Claude's permission mode for native tools and native Agent subagents:
+  - **Ask for approval** runs Claude's `auto` mode: Claude's classifier approves or blocks each action. Interactive Claude approval prompts are unsupported; denials are reported.
+  - **Full access** runs Claude's `bypassPermissions` mode with no permission checks. Claude refuses bypass in its restricted mode, so these turns load your normal Claude Code settings and plugins; hooks stay disabled and the Codex relay stays the only MCP server.
+  - **Approve for me** is refused because it hands approvals to Codex's reviewer model.
+  - Read-only side chats always use `auto` with Read/Glob/Grep only.
 - Codex's OS sandbox does not contain native Claude tools. The runtime uses restricted settings, disables hooks/skills, and supplies only the configured relay MCP server. Read-only tasks use only Read/Glob/Grep, without browser access or native subagents.
 - The relay exposes `cua_repl.js`/`js_reset` and task `list_threads`, `read_thread`, `wait_threads`, and `send_message_to_thread` when the host provides them. Other Codex connectors and task-management tools are not currently forwarded.
 - Forwarded tools execute through the official Codex core and its permission checks. Host approvals may still require user input. Required model-based review is refused instead of silently invoking an OpenAI reviewer or bypassing a policy.

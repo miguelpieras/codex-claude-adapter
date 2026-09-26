@@ -105,6 +105,16 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn('--bare', call['args'])
         self.assertNotIn('--dangerously-skip-permissions', call['args'])
 
+    def test_full_access_selects_bypass_mode_except_read_only(self):
+        self.runtime.bind(self.thread, self.root, full_access=True)
+        self.run_turn(self.thread, self.request('full'))
+        side = str(uuid.uuid4())
+        self.runtime.bind(side, self.root, readonly=True, full_access=True)
+        self.run_turn(side, self.request('side'))
+        modes = [v['args'][v['args'].index('--permission-mode') + 1]
+                 for v in map(json.loads, (self.root / 'calls.jsonl').read_text().splitlines())]
+        self.assertEqual(modes, ['bypassPermissions', 'auto'])
+
     def test_parallel_and_idempotent(self):
         other = str(uuid.uuid4())
         self.runtime.bind(other, self.root)

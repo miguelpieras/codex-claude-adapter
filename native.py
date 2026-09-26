@@ -139,11 +139,12 @@ class NativeRuntime:
         self.system = system
         self.inline_images = inline_images
 
-    def bind(self, thread_id, cwd, *, readonly=False, model=MODEL, effort=None):
+    def bind(self, thread_id, cwd, *, readonly=False, model=MODEL, effort=None, full_access=False):
         uuid.UUID(thread_id)
         cwd = str(Path(cwd).resolve(strict=True))
         with self.guard:
-            self.bindings[thread_id] = {'cwd': cwd, 'readonly': readonly, 'model': model, 'effort': effort}
+            self.bindings[thread_id] = {'cwd': cwd, 'readonly': readonly, 'model': model, 'effort': effort,
+                                        'full_access': full_access and not readonly}
 
     def cancel(self, thread_id):
         if self.browser:
@@ -218,13 +219,17 @@ class NativeRuntime:
                     browser_token, config = browser
                     # Safe mode disables even explicit MCP. Restricted mode
                     # ignores user/project settings; only this MCP is supplied.
-                    customization = ['--restricted', '--disable-slash-commands',
+                    # Claude refuses bypassPermissions in restricted mode, so
+                    # Full access keeps hooks off and MCP strict without it.
+                    restricted = [] if binding['full_access'] else ['--restricted']
+                    customization = [*restricted, '--disable-slash-commands',
                         '--settings', json.dumps({'disableAllHooks': True, 'autoMemoryEnabled': False}),
                         '--mcp-config', json.dumps(config), '--system-prompt-snapshot', 'off']
                 else:
                     emit('Codex browser tools are unavailable for this task; native Claude tools remain available.')
             cmd = [str(CLAUDE), *customization, '--strict-mcp-config',
-                   '--permission-mode', 'auto', '--permission-prompts', 'none',
+                   '--permission-mode', 'bypassPermissions' if binding['full_access'] else 'auto',
+                   '--permission-prompts', 'none',
                    '--model', model, '--effort', effort, '--tools',
                    'Read,Glob,Grep' if binding['readonly'] else 'default',
                    '--append-system-prompt', self.system, '--output-format', 'stream-json',
