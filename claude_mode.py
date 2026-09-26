@@ -114,7 +114,7 @@ def configure(home, state):
         raise RuntimeError('Claude profile now selects another provider; refusing to overwrite it.')
     if not existing:
         existing = ('model=' + json.dumps(MODEL) + '\nmodel_provider=' + json.dumps(PROVIDER) +
-            '\nmodel_reasoning_effort="medium"\nmodel_supports_reasoning_summaries=false\n'
+            '\nmodel_reasoning_effort="medium"\n'
             'approval_policy="on-request"\napprovals_reviewer="user"\nsandbox_mode="workspace-write"\n'
             'web_search="disabled"\nmodel_catalog_json=' + json.dumps(str(home / 'claude-models.json')) + '\n'
             '\n[analytics]\nenabled=false\n')
@@ -154,6 +154,9 @@ def write_provider(home, provider):
         try:
             await core.call('initialize', {'clientInfo': {'name': 'claude_mode_config', 'version': '1.0'}})
             await core.send({'method': 'initialized'})
+            if 'model_supports_reasoning_summaries' in tomllib.loads((home / 'config.toml').read_text()):
+                await core.call('config/value/write', {'keyPath': 'model_supports_reasoning_summaries',
+                    'value': None, 'mergeStrategy': 'replace'})
             await core.call('config/value/write', {'keyPath': 'model_providers.' + PROVIDER,
                 'value': provider, 'mergeStrategy': 'replace'})
         finally:
