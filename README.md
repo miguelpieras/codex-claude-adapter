@@ -11,6 +11,8 @@ The standalone service leaves the official Codex app and its app-server process 
 Requires an installed Codex desktop app, Python 3.11+, and Claude Code logged in with a supported Claude subscription. Run `claude` and `/login` if needed. The tested Claude Code version is 2.1.282.
 
 ```sh
+git clone https://github.com/miguelpieras/codex-claude-adapter.git
+cd codex-claude-adapter
 python3 claude_mode.py launch
 ```
 
@@ -51,6 +53,7 @@ Unknown models, missing attribution, and requests requiring an OpenAI host appro
 ## Tools and permissions
 
 - Native Claude tools and native Agent subagents run in Claude's `auto` permission mode, without `--dangerously-skip-permissions`. Interactive Claude approval prompts are unsupported; denials are reported.
+- In Codex's permission picker, choose **Ask for approval** or **Full access**. Claude's own tools stay in Claude's Auto mode with either; the picker only changes how Codex handles forwarded browser and task tools. **Approve for me** is refused because it hands approvals to Codex's reviewer model.
 - Codex's OS sandbox does not contain native Claude tools. The runtime uses restricted settings, disables hooks/skills, and supplies only the configured relay MCP server. Read-only tasks use only Read/Glob/Grep, without browser access or native subagents.
 - The relay exposes `cua_repl.js`/`js_reset` and task `list_threads`, `read_thread`, `wait_threads`, and `send_message_to_thread` when the host provides them. Other Codex connectors and task-management tools are not currently forwarded.
 - Forwarded tools execute through the official Codex core and its permission checks. Host approvals may still require user input. Required model-based review is refused instead of silently invoking an OpenAI reviewer or bypassing a policy.

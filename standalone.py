@@ -47,7 +47,8 @@ def binding_for(home, tid, model, metadata):
     uuid.UUID(tid)
     uuid.UUID(metadata.get('turn_id', ''))
     if metadata.get('auto_review_enabled') is not False or metadata.get('node_repl_auto_review_required') is not False:
-        raise ValueError('Host model review is required; refusing inference without bypassing it.')
+        raise ValueError('Claude mode does not support "Approve for me": it hands approvals to a Codex reviewer model. '
+                         'Choose "Ask for approval" or "Full access"; Claude still runs in its own Auto mode.')
     mode = metadata.get('sandbox_mode')
     if mode not in ('read-only', 'workspace-write', 'danger-full-access'):
         raise ValueError('Missing or unsupported host permissions.')
