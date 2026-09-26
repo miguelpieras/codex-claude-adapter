@@ -23,11 +23,25 @@ PERMISSIONS = ('auto', 'manual', 'bypassPermissions')
 SETTINGS = ('--setting-sources', 'user')
 THINKING_QUOTE = '> **Thinking**'  # quoted thinking from older adapter versions, still in task history
 RELAYED = 'mcp__codex_browser__'  # tools Codex runs itself and already shows as native rows
+SHELL_TOOLS = (RELAYED + 'exec_command', RELAYED + 'write_stdin')
+# Claude Code reports a 1M window for Opus 5.5 and Fable 5.1 and compacts its own session near
+# it. Reported context stays under Codex's own compaction threshold (90% of the window).
+CONTEXT_WINDOW = 1_000_000
+REPORTED_CONTEXT_LIMIT = int(CONTEXT_WINDOW * 0.85)
+SHELL_PROMPT = '''
+Shell commands run through Codex, which shows them to the user as its own rows: use the
+exec_command tool (Bash and Monitor are unavailable). Each call starts a fresh shell in the task folder, so
+pass workdir or cd inside the command. If the result says the process is still running with a
+session ID, poll it with write_stdin (that session_id, empty chars) until it exits. Codex's
+sandbox and approval rules apply: only when the sandbox blocks a command you need, retry once
+with sandbox_permissions "require_escalated" and a one-line justification.
+'''
 # Tool name -> (kind, input field). Kinds mirror Codex's own row wording.
 KINDS = {'Bash': ('command', 'command'), 'Read': ('read', 'file_path'), 'Edit': ('edit', 'file_path'),
          'MultiEdit': ('edit', 'file_path'), 'Write': ('edit', 'file_path'), 'NotebookEdit': ('edit', 'notebook_path'),
          'Grep': ('search', 'pattern'), 'Glob': ('list', 'pattern'), 'WebSearch': ('web', 'query'),
-         'WebFetch': ('fetch', 'url'), 'Agent': ('agent', 'description'), 'Task': ('agent', 'description')}
+         'WebFetch': ('fetch', 'url'), 'Agent': ('agent', 'description'), 'Task': ('agent', 'description'),
+         RELAYED + 'exec_command': ('command', 'cmd')}
 LIVE = {'command': 'Running', 'read': 'Reading', 'edit': 'Editing', 'search': 'Searching for', 'list': 'Listing',
         'web': 'Searching the web for', 'fetch': 'Fetching', 'agent': 'Starting agent'}
 
@@ -309,13 +323,15 @@ class NativeRuntime:
             check_auth(binding['cwd'])
             inputs = request.get('input', [])
             prefix = state.get('input_count', 0)
-            resume = (state.get('status') == 'completed' and state.get('cwd') == binding['cwd']
+            # A session that started keeps its context even if the turn was stopped.
+            resumable = state.get('status') == 'completed' or (state.get('status') == 'interrupted' and state.get('started'))
+            resume = (resumable and state.get('cwd') == binding['cwd']
                       and state.get('model', MODEL) == model
                       and isinstance(inputs, list) and prefix > 0 and len(inputs) > prefix
                       and digest(inputs[:prefix]) == state.get('input_digest'))
-            if (state.get('status') == 'completed' and state.get('cwd') == binding['cwd']
-                    and state.get('model', MODEL) == model and isinstance(inputs, list)):
-                # Codex compacted its history: continue the same Claude session after the marker.
+            if resumable and state.get('cwd') == binding['cwd'] and isinstance(inputs, list):
+                # Codex compacted its history: continue the same Claude session after the marker,
+                # even after a model switch, since Codex's copy no longer holds the context.
                 marker = session_marker(state.get('session_id'))
                 at = max((i for i, item in enumerate(inputs) if marker in json.dumps(item)), default=None)
                 if at is not None and len(inputs) > at + 1 and (not resume or at + 1 > prefix):
@@ -338,6 +354,8 @@ class NativeRuntime:
                        'continuation': bool(resume)}
             framed = inline_image_message(payload) if media else None
             customization = ['--safe-mode']
+            tools = []  # Claude tool flags when Codex runs the shell
+            system = self.system
             permission = binding['permission']
             # Without a way to ask the user, anything that would prompt is denied.
             prompts = ['--permission-prompts', 'none']
@@ -355,6 +373,11 @@ class NativeRuntime:
                     customization = ['--disable-slash-commands',
                         '--settings', json.dumps({'disableAllHooks': True, 'autoMemoryEnabled': False}),
                         '--mcp-config', json.dumps(config), '--system-prompt-snapshot', 'off']
+                    if 'exec_command' in self.browser.tool_names(browser_token):
+                        # Codex's sandbox and approval rules gate these, so Claude does not ask twice.
+                        # Monitor's command mode is also a shell; both stay with Codex.
+                        tools = ['--disallowedTools', 'Bash,Monitor', '--allowedTools', ','.join(SHELL_TOOLS)]
+                        system = self.system + SHELL_PROMPT
                     if permission == 'manual' and APPROVAL in self.browser.tool_names(browser_token):
                         prompts = ['--permission-prompts', 'host',
                                    '--permission-prompt-tool', 'mcp__codex_browser__' + APPROVAL]
@@ -364,7 +387,7 @@ class NativeRuntime:
                    '--permission-mode', permission, *prompts,
                    '--model', model, '--effort', effort, '--tools',
                    'Read,Glob,Grep' if binding['readonly'] else 'default',
-                   '--append-system-prompt', self.system, '--output-format', 'stream-json',
+                   *tools, '--append-system-prompt', system, '--output-format', 'stream-json',
                    '--verbose', '--forward-subagent-text', '-p',
                    # Readable thinking (hidden by default under -p), streamed live as it is written.
                    '--thinking-display', 'summarized', '--include-partial-messages']
@@ -389,8 +412,11 @@ class NativeRuntime:
                 finally:
                     events.put(None)
             threading.Thread(target=read, daemon=True).start()
-            process.stdin.write(json.dumps(framed or payload) + ('\n' if framed else ''))
-            process.stdin.close()
+            try:
+                process.stdin.write(json.dumps(framed or payload) + ('\n' if framed else ''))
+                process.stdin.close()
+            except (BrokenPipeError, ConnectionResetError):  # cancelled or exited before reading
+                raise ValueError('Claude turn interrupted before Claude Code read the request.')
             result = None
             denials = []
             labels = {}  # tool_use_id -> short label, to name blocked calls
@@ -440,6 +466,9 @@ class NativeRuntime:
                         self.cancel(thread_id)
                         raise ValueError('Claude Code did not start on your subscription login with ' + model +
                                          ' (apiKeySource=' + str(event.get('apiKeySource')) + '). Nothing was sent to a fallback.')
+                    if not state.get('started'):
+                        state['started'] = True
+                        atomic_json(path, state)
                 elif kind == 'stream_event' and main:
                     inner = event.get('event') or {}
                     if inner.get('type') == 'message_start':
@@ -463,7 +492,15 @@ class NativeRuntime:
                             # block after live deltas only closes the live item.
                             emit('' if streamed else block.get('thinking') or '', 'thinking_done')
                             streamed = False
-                        elif block.get('type') == 'tool_use' and not str(block.get('name')).startswith(RELAYED):
+                        elif block.get('type') == 'tool_use' and str(block.get('name')).startswith(RELAYED):
+                            # Codex shows this call as its own row: put earlier progress above it.
+                            if main:
+                                flush()
+                            close_burst()
+                            if not main and block.get('name') == RELAYED + 'exec_command':
+                                agents.setdefault(event['parent_tool_use_id'],
+                                                  [event.get('task_description') or 'agent', Tally()])[1].add(*classify(block))
+                        elif block.get('type') == 'tool_use':
                             tool, name, value = classify(block)
                             labels[block.get('id')] = name + (' ' + code(value) if value else '')
                             if main:
@@ -511,6 +548,8 @@ class NativeRuntime:
             if denials:
                 final += '\n\nClaude Code denied ' + str(len(denials)) + ' tool permission request(s). Those actions were not approved.'
             usage = {**context, 'output_tokens': output} if context else result.get('usage', {})
+            if sum(usage.get(k, 0) for k in ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')) > REPORTED_CONTEXT_LIMIT:
+                usage = {'input_tokens': REPORTED_CONTEXT_LIMIT, 'output_tokens': usage.get('output_tokens', 0)}
             state.update(status='completed', result=final, usage=usage)
             atomic_json(path, state)
             return final, state['usage']

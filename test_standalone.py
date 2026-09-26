@@ -75,8 +75,8 @@ class CompactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
             home, tid = Path(temporary), str(uuid.uuid4())
             with closing(sqlite3.connect(home / 'state_5.sqlite')) as db:
-                db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, model TEXT, model_provider TEXT)')
-                db.execute('INSERT INTO threads VALUES (?, ?, ?, ?)', (tid, str(home), native.MODEL, service.PROVIDER))
+                db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, model TEXT, model_provider TEXT, rollout_path TEXT)')
+                db.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?)', (tid, str(home), native.MODEL, service.PROVIDER, None))
                 db.commit()
             server = service.service(home / 'sessions', home=home)
             native.atomic_json(server.native.directory / (tid + '.json'), {'session_id': 'S1', 'status': 'completed'})
@@ -97,6 +97,19 @@ class CompactionTests(unittest.TestCase):
                 server.native.infer.assert_not_called()
             finally:
                 server.shutdown(); server.server_close()
+
+    def test_side_chat_compaction_is_answered_without_a_marker(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            home, parent, child = Path(temporary), str(uuid.uuid4()), str(uuid.uuid4())
+            with closing(sqlite3.connect(home / 'state_5.sqlite')) as db:
+                db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, model TEXT, model_provider TEXT, rollout_path TEXT)')
+                db.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?)', (parent, str(home), native.MODEL, service.PROVIDER, None))
+                db.commit()
+            meta = {'thread_id': child, 'request_kind': 'compaction', 'forked_from_thread_id': parent}
+            note = service.compaction_note(home, home, child, native.MODEL, meta)
+            self.assertNotIn('[claude-session:', note)
+            with self.assertRaises(ValueError):
+                service.compaction_note(home, home, child, native.MODEL, {**meta, 'forked_from_thread_id': str(uuid.uuid4())})
 
     def test_new_profile_turns_off_codex_memories(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -129,8 +142,8 @@ class ConversionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             parent = str(uuid.uuid4())
             with closing(sqlite3.connect(Path(root) / 'state_5.sqlite')) as db:
-                db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, model TEXT, model_provider TEXT)')
-                db.execute('INSERT INTO threads VALUES (?, ?, ?, ?)', (parent, root, native.MODEL, service.PROVIDER))
+                db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, model TEXT, model_provider TEXT, rollout_path TEXT)')
+                db.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?)', (parent, root, native.MODEL, service.PROVIDER, None))
                 db.commit()
             meta = {'subagent_kind': 'guardian', 'model': native.MODEL, 'parent_thread_id': parent}
             guardian = {'x-openai-subagent': 'guardian'}
@@ -155,6 +168,14 @@ class ConversionTests(unittest.TestCase):
             with patch.object(claude_mode, 'require_codex'), self.assertRaisesRegex(RuntimeError, 'too long'):
                 claude_mode.prepare(directory)
             self.assertFalse(directory.exists())
+
+    def test_codex_shell_tools_are_relayed(self):
+        tools = service.descriptors([
+            {'type': 'function', 'name': 'exec_command', 'parameters': {'type': 'object'}},
+            {'type': 'function', 'name': 'write_stdin', 'parameters': {'type': 'object'}},
+            {'type': 'function', 'name': 'view_image', 'parameters': {'type': 'object'}},
+            {'type': 'custom', 'name': 'apply_patch'}])
+        self.assertEqual(set(tools), {'exec_command', 'write_stdin'})
 
     def test_namespaced_tools_preserve_schema_and_exclude_host_agents(self):
         schema = {'type': 'object', 'properties': {'code': {'type': 'string'}}, 'required': ['code']}
@@ -319,6 +340,54 @@ class RelayTests(unittest.TestCase):
         self.assertIn('"path": "/etc"', question)
         self.assertEqual(json.loads(result['content'][0]['text']),
                          {'behavior': 'allow', 'updatedInput': {'pattern': 'key', 'path': '/etc'}})
+
+    def test_full_access_shell_calls_drop_escalation_and_wait_for_approval_cards(self):
+        shell = {'type': 'function', 'name': 'exec_command', 'parameters': {'type': 'object'}}
+        request = {**self.request, 'tools': [*self.request['tools'], shell]}
+        turn = service.Turn(self.tid, request, self.metadata)
+        self.server.native.bind(self.tid, str(self.home), permission='bypassPermissions')
+        waits = []
+        def forward(turn, item, seconds):
+            waits.append((json.loads(item['arguments']), seconds))
+            return 'Process exited with code 0'
+        with patch.object(self.server.browser, 'forward', side_effect=forward):
+            self.server.turns[self.tid] = turn
+            token, _ = self.server.browser.open(self.tid, self.metadata, model=native.MODEL)
+            asyncio.run(self.server.browser.call(token, 'exec_command', {'cmd': 'ls', 'sandbox_permissions': 'require_escalated',
+                                                                          'justification': 'x', 'prefix_rule': ['ls']}))
+            self.server.browser.close(token)
+        self.assertEqual([args for args, _ in waits], [{'cmd': 'ls'}])
+        self.assertAlmostEqual(waits[0][1], 120, delta=1)  # no approval card can appear under Full access
+
+    def test_shell_waits_match_what_can_keep_codex_busy(self):
+        shell = [{'type': 'function', 'name': name, 'parameters': {'type': 'object'}} for name in ('exec_command', 'write_stdin')]
+        turn = service.Turn(self.tid, {**self.request, 'tools': [*self.request['tools'], *shell]}, self.metadata)
+        self.server.native.bind(self.tid, str(self.home), permission='manual')
+        waits = []
+        with patch.object(self.server.browser, 'forward', side_effect=lambda t, item, seconds: waits.append(seconds) or 'ok'):
+            self.server.turns[self.tid] = turn
+            token, _ = self.server.browser.open(self.tid, self.metadata, model=native.MODEL)
+            asyncio.run(self.server.browser.call(token, 'exec_command', {'cmd': 'rm -rf build'}))
+            asyncio.run(self.server.browser.call(token, 'write_stdin', {'session_id': 1}))
+            self.server.browser.close(token)
+        self.assertAlmostEqual(waits[0], service.APPROVAL_WAIT, delta=1)  # a Codex approval card may be open
+        self.assertAlmostEqual(waits[1], 360, delta=1)
+
+    def test_stop_in_codex_ends_a_wait_for_a_host_result(self):
+        log = self.home / 'rollout.jsonl'
+        log.write_text('{"type":"session_meta"}\n')
+        turn = service.Turn(self.tid, self.request, self.metadata)
+        turn.log = [str(log), log.stat().st_size]
+        def stop():
+            time.sleep(.5)
+            with log.open('a') as out:
+                out.write('{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"' + self.metadata['turn_id'] + '"}}\n')
+        threading.Thread(target=stop, daemon=True).start()
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            self.server.browser.forward(turn, {'call_id': 'c1'}, 60)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(turn.stopped.is_set())
 
     def test_relay_mcp_timeout_outlasts_the_approval_wait(self):
         self.server.turns[self.tid] = service.Turn(self.tid, self.request, self.metadata)

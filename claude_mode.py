@@ -18,7 +18,7 @@ import urllib.request
 from urllib.parse import urlparse
 
 from adapter import make_catalog, Core
-from native import MODEL, MODELS, atomic_json, check_auth
+from native import CONTEXT_WINDOW, MODEL, MODELS, atomic_json, check_auth
 from paths import APP, CODEX, require_codex
 from standalone import PROVIDER, service
 import app_icon
@@ -26,7 +26,6 @@ import app_icon
 ROOT = Path(__file__).resolve().parent
 HOME = Path.home() / '.codex'
 DIRECTORY = Path.home() / '.codex-claude'
-CONTEXT_WINDOW = 1_000_000
 # Profile settings the adapter owns. Codex memories run on an OpenAI model, which Claude
 # mode never uses; the question tool shows Claude permission prompts.
 PROFILE = {'features.default_mode_request_user_input': True, 'features.memories': False,

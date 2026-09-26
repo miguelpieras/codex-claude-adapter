@@ -9,6 +9,7 @@ from collections import deque
 from contextlib import closing
 import hmac
 import json
+import os
 from pathlib import Path
 import queue
 import secrets
@@ -24,6 +25,8 @@ from browser import BrowserBridge
 
 PROVIDER = 'claude-standalone'
 COORDINATION = {'list_threads', 'read_thread', 'wait_threads', 'send_message_to_thread'}
+SHELL = ('exec_command', 'write_stdin')  # Codex's own shell: native rows, sandbox and approval cards
+ESCALATION = ('sandbox_permissions', 'justification', 'prefix_rule')  # rejected by Codex under Full access
 APPROVAL_WAIT = 3600  # seconds a Claude permission question waits for the user
 QUESTION_LIMIT = 4000  # longer requests are denied rather than shown truncated
 SYSTEM = native.SYSTEM.replace('Other Codex app connectors and\nvoice are unavailable.',
@@ -38,8 +41,36 @@ def task_record(home, tid):
         return None
     with closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
         db.row_factory = sqlite3.Row
-        row = db.execute('SELECT cwd, model, model_provider FROM threads WHERE id = ?', (tid,)).fetchone()
+        row = db.execute('SELECT cwd, model, model_provider, rollout_path FROM threads WHERE id = ?', (tid,)).fetchone()
         return dict(row) if row else None
+
+
+def rollout_log(home, tid):
+    """[path, offset] of the task's Codex log from now on, to notice a Stop."""
+    row = task_record(home, tid)
+    path = row and row.get('rollout_path')
+    try:
+        return [path, os.path.getsize(path)] if path else None
+    except OSError:
+        return None
+
+
+def turn_aborted(turn):
+    """Codex tells the provider nothing when the user presses Stop, but writes turn_aborted
+    for that turn to the task's log. Reads only complete lines added since the last check."""
+    if not turn.log:
+        return False
+    path, offset = turn.log
+    try:
+        with open(path, 'rb') as log:
+            log.seek(offset)
+            data = log.read()
+    except OSError:
+        return False
+    cut = data.rfind(b'\n') + 1
+    turn.log[1] = offset + cut
+    ident = ('"turn_id":"' + str(turn.metadata.get('turn_id')) + '"').encode()
+    return any(b'"turn_aborted"' in line and ident in line for line in data[:cut].splitlines())
 
 
 def binding_for(home, tid, model, metadata):
@@ -88,7 +119,9 @@ def compaction_note(home, directory, tid, model, metadata):
     if model not in native.MODELS or metadata.get('thread_id') != tid:
         raise ValueError('Compaction request does not match this Claude task; no fallback.')
     row = task_record(home, tid)
-    if not row or row['model_provider'] != PROVIDER:
+    parent = metadata.get('forked_from_thread_id')
+    parent = task_record(home, parent) if not row and isinstance(parent, str) else None
+    if (row or parent or {}).get('model_provider') != PROVIDER:
         raise ValueError('Compaction request does not belong to a Claude-mode task.')
     path = Path(directory) / (tid + '.json')
     session = (json.loads(path.read_text()) if path.exists() else {}).get('session_id')
@@ -114,10 +147,11 @@ def descriptors(tools, namespace=None):
         if tool.get('type') == 'namespace':
             result.update(descriptors(tool.get('tools', []), tool['name']))
         elif tool.get('type') == 'function':
-            # Narrow proof: browser + task tools. Native Claude keeps all its
-            # own execution tools and subagents. No host subagent forwarding.
+            # Browser, task and shell tools run in Codex. Claude keeps its own file tools
+            # and subagents. No host subagent forwarding.
             if (namespace == 'mcp__cua_repl' and tool['name'] in ('js', 'js_reset') or
-                namespace == 'mcp__codex_app' and tool['name'] in COORDINATION):
+                namespace == 'mcp__codex_app' and tool['name'] in COORDINATION or
+                namespace is None and tool['name'] in SHELL):
                 ident = (namespace + '__' if namespace else '') + tool['name']
                 result[ident] = {**tool, 'namespace': namespace}
     return result
@@ -159,6 +193,7 @@ class Turn:
         self.http_lock, self.tool_lock = threading.Lock(), threading.Lock()
         self.pending = None
         self.unseen = None  # index of a steered user message Claude never received
+        self.log = None  # [rollout path, offset] for Stop detection
         self.completed = False
         self.done = threading.Event()
         self.last_input = request.get('input', [])
@@ -181,7 +216,9 @@ class Relay(BrowserBridge):
         token = secrets.token_urlsafe(32)
         tools = [{'name': name, 'description': tool.get('description', ''),
                   'inputSchema': tool['parameters'],
-                  'annotations': {'readOnlyHint': False, 'openWorldHint': True}}
+                  'annotations': {'readOnlyHint': False, 'openWorldHint': True},
+                  # Load up front instead of behind ToolSearch, saving a model turn per agent.
+                  '_meta': {'anthropic/alwaysLoad': True}}
                  for name, tool in turn.tools.items()]
         if turn.ask and (self.server.native.bindings.get(thread_id) or {}).get('permission') == 'manual':
             tools.append({'name': native.APPROVAL,
@@ -206,11 +243,20 @@ class Relay(BrowserBridge):
             return self.approve(turn, arguments)
         if name not in turn.tools or not isinstance(arguments, dict):
             raise ValueError('Unavailable host tool or invalid arguments.')
-        # One outstanding host call per task; separate tasks run concurrently.
-        with turn.tool_lock:
+        tool = turn.tools[name]
+        permission = (self.server.native.bindings.get(turn.tid) or {}).get('permission')
+        # Only a Codex approval card (or reviewer) can keep a command waiting on the user; there
+        # is none under Full access. exec_command yields within 30s and write_stdin within 300s.
+        wait = ((120 if permission == 'bypassPermissions' else APPROVAL_WAIT) if tool['name'] == 'exec_command'
+                else 360 if tool['name'] == 'write_stdin' else 120)
+        deadline = time.monotonic() + wait
+        # One outstanding host call per task; separate tasks run concurrently. A call that cannot
+        # start before its deadline is dropped, never run after Claude stopped waiting for it.
+        if not turn.tool_lock.acquire(timeout=wait):
+            raise ValueError('Timed out waiting for another Codex tool call; nothing was run.')
+        try:
             if turn.stopped.is_set():
                 raise ValueError('Cancelled task.')
-            tool = turn.tools[name]
             if tool['name'] == 'send_message_to_thread':
                 target = arguments.get('threadId')
                 if arguments.get('hostId', 'local') != 'local':
@@ -225,23 +271,31 @@ class Relay(BrowserBridge):
                     'name': tool['name'], 'arguments': json.dumps(arguments)}
             if tool.get('namespace'):
                 item['namespace'] = tool['namespace']
-            result = mcp_result(self.forward(turn, item, 120))
+            if tool['name'] in SHELL and permission == 'bypassPermissions':
+                # Full access runs with approval policy "never", which rejects escalation requests.
+                item['arguments'] = json.dumps({k: v for k, v in arguments.items() if k not in ESCALATION})
+            result = mcp_result(self.forward(turn, item, deadline - time.monotonic()))
             self.server.observations.append({'tool': name, 'returned': True,
                 'content_types': [v.get('type') for v in result.get('content', [])]})
             return result
+        finally:
+            turn.tool_lock.release()
 
     def forward(self, turn, item, seconds):
         """Hand one function call to Codex and wait for its exact result. Caller holds tool_lock."""
         turn.pending = item['call_id']
         turn.events.put(('call', item))
-        deadline = time.monotonic() + seconds
+        deadline, checked = time.monotonic() + seconds, time.monotonic()
         while not turn.stopped.is_set() and time.monotonic() < deadline:
             try:
                 output = turn.outputs.get(timeout=.25)
                 turn.pending = None
                 return output
             except queue.Empty:
-                pass
+                if time.monotonic() - checked >= 1:
+                    checked = time.monotonic()
+                    if turn_aborted(turn):
+                        break  # the user pressed Stop in Codex
         turn.stopped.set()
         raise ValueError('Host continuation missing or cancelled; no retry.')
 
@@ -264,12 +318,18 @@ class Relay(BrowserBridge):
         questions = [{'id': 'claude_permission', 'header': 'Claude', 'question': question, 'options': [
             {'label': 'Allow', 'description': 'Let Claude run this action once.'},
             {'label': 'Deny', 'description': 'Block it; Claude continues without it.'}]}]
-        with turn.tool_lock:
+        deadline = time.monotonic() + APPROVAL_WAIT
+        if not turn.tool_lock.acquire(timeout=APPROVAL_WAIT):
+            raise ValueError('Timed out waiting for another Codex tool call; the action was not approved.')
+        try:
             if turn.stopped.is_set():
                 raise ValueError('Cancelled task.')
             output = self.forward(turn, {'type': 'function_call', 'id': 'fc_' + uuid.uuid4().hex,
                 'call_id': 'call_' + uuid.uuid4().hex, 'status': 'completed',
-                'name': 'request_user_input', 'arguments': json.dumps({'questions': questions})}, APPROVAL_WAIT)
+                'name': 'request_user_input', 'arguments': json.dumps({'questions': questions})},
+                deadline - time.monotonic())
+        finally:
+            turn.tool_lock.release()
         try:
             answers = json.loads(output)['answers']['claude_permission']['answers']
         except (ValueError, KeyError, TypeError):
@@ -325,7 +385,9 @@ class ServiceHandler(Handler):
         streaming = False
         try:
             size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= 8_000_000:
+            # Codex resends the whole task history, command output included. A compaction request
+            # may be larger than a turn is allowed to be, since answering it is what shrinks history.
+            if not 0 < size <= 512_000_000:
                 raise ValueError('Invalid request size.')
             request = json.loads(self.rfile.read(size))
             tid = self.headers.get('thread-id', '')
@@ -339,6 +401,8 @@ class ServiceHandler(Handler):
                 self.end_headers()
                 Stream(self, request['model']).finish(note, {})
                 return
+            if size > 64_000_000:
+                raise ValueError('This task history is too large (' + str(size // 1_000_000) + ' MB). Compact it or start a new task.')
             review_cwd = review_for(self.server.home, request.get('model'), metadata, self.headers)
             if review_cwd:
                 self.send_response(200)
@@ -397,6 +461,7 @@ class ServiceHandler(Handler):
                 if fresh:
                     self.server.native.bind(tid, **binding)
                     turn = Turn(tid, request, metadata)
+                    turn.log = rollout_log(self.server.home, tid)
                     self.server.turns[tid] = turn
                 elif turn.metadata != metadata or turn.model != request['model']:
                     raise ValueError('Continuation changed task attribution or model.')

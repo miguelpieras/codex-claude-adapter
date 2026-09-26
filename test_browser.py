@@ -131,6 +131,7 @@ class NativeBrowserTests(unittest.TestCase):
     def test_browser_config_lifetime_and_readonly(self):
         browser = Mock()
         browser.open.return_value = ('private-token', {'mcpServers': {'codex_browser': {}}})
+        browser.tool_names.return_value = {'js'}
         self.runtime.browser = browser
         self.run_turn(self.thread, self.request())
         call = json.loads((self.root / 'calls.jsonl').read_text())
@@ -141,6 +142,19 @@ class NativeBrowserTests(unittest.TestCase):
         self.assertNotIn('--safe-mode', call['args'])
         self.assertNotIn('--allowedTools', call['args'])
         browser.close.assert_called_once_with('private-token')
+        self.assertNotIn('--disallowedTools', call['args'])  # Claude keeps Bash unless Codex's shell is relayed
+
+    def test_codex_shell_replaces_claude_bash_when_relayed(self):
+        browser = Mock()
+        browser.open.return_value = ('private-token', {'mcpServers': {'codex_browser': {}}})
+        browser.tool_names.return_value = {'js', 'exec_command', 'write_stdin'}
+        self.runtime.browser = browser
+        self.run_turn(self.thread, self.request())
+        args = json.loads((self.root / 'calls.jsonl').read_text())['args']
+        self.assertEqual(args[args.index('--disallowedTools') + 1], 'Bash,Monitor')
+        self.assertEqual(args[args.index('--allowedTools') + 1],
+                         'mcp__codex_browser__exec_command,mcp__codex_browser__write_stdin')
+        self.assertIn('exec_command', args[args.index('--append-system-prompt') + 1])
         browser.reset_mock()
         self.runtime.bind(self.thread, self.root, readonly=True)
         self.run_turn(self.thread, self.request('read-only'))

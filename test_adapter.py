@@ -36,7 +36,7 @@ print(json.dumps({'type':'system','subtype':'init','model':model,'apiKeySource':
 final='CLAUDE_FIXTURE history='+str('HISTORY_123' in json.dumps(request))
 print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','name':'Read','id':'tool_1','input':{'file_path':'fixture.txt'}}]}}),flush=True)
 if 'STREAM' in json.dumps(request):
- for e in [{'type':'stream_event','event':{'type':'message_start','message':{'usage':{'input_tokens':5,'cache_read_input_tokens':40000,'cache_creation_input_tokens':100}}},'parent_tool_use_id':None},
+ for e in [{'type':'stream_event','event':{'type':'message_start','message':{'usage':{'input_tokens':5,'cache_read_input_tokens':(990000 if 'HUGE' in json.dumps(request) else 40000),'cache_creation_input_tokens':100}}},'parent_tool_use_id':None},
   {'type':'stream_event','event':{'type':'message_delta','delta':{'stop_reason':'end_turn'},'usage':{'output_tokens':7}},'parent_tool_use_id':None},
   {'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':'Plan: '}},'parent_tool_use_id':None},
   {'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':'read files'}},'parent_tool_use_id':None},
@@ -51,6 +51,8 @@ if 'STREAM' in json.dumps(request):
 if 'AGENTS' in json.dumps(request):
  for e in [{'type':'assistant','message':{'content':[{'type':'tool_use','name':'Agent','id':'ag1','input':{'description':'Audit billing','prompt':'x'}}]},'parent_tool_use_id':None},
   {'type':'assistant','message':{'content':[{'type':'tool_use','name':'Read','id':'r1','input':{'file_path':'/w/src/refunds.ts'}}]},'parent_tool_use_id':'ag1','task_description':'Audit billing'},
+  {'type':'assistant','message':{'content':[{'type':'tool_use','name':'mcp__codex_browser__exec_command','id':'x1','input':{'cmd':'wc -l a.py'}}]},'parent_tool_use_id':'ag1','task_description':'Audit billing'},
+  {'type':'assistant','message':{'content':[{'type':'text','text':'Checking the page.'}]},'parent_tool_use_id':None},
   {'type':'assistant','message':{'content':[{'type':'tool_use','name':'mcp__codex_browser__js','id':'b1','input':{'code':'1'}}]},'parent_tool_use_id':None},
   {'type':'system','subtype':'task_notification','tool_use_id':'ag1','status':'completed'},
   {'type':'assistant','message':{'content':[{'type':'text','text':final}]},'parent_tool_use_id':None}]:
@@ -201,8 +203,10 @@ class NativeTests(unittest.TestCase):
             ('status', 'Reading fixture.txt'),
             ('status', 'Starting agent Audit billing'),
             ('status', 'Audit billing: Reading refunds.ts'),
+            # A relayed call is Codex's own row: earlier progress is emitted before it.
             ('message', 'Read `fixture.txt`, started agent **Audit billing**'),
-            ('message', 'Agent **Audit billing** finished: read `refunds.ts`')])  # browser call: Codex shows it natively
+            ('message', 'Checking the page.'),
+            ('message', 'Agent **Audit billing** finished: read `refunds.ts`, ran `wc -l a.py`')])
 
     def test_burst_summary_uses_codex_wording(self):
         tally = native.Tally()
@@ -224,6 +228,34 @@ class NativeTests(unittest.TestCase):
         call = json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])
         self.assertEqual(call['args'][call['args'].index('--resume') + 1], session)
         self.assertEqual(call['request']['input'], [{'role': 'user', 'content': 'after compaction'}])
+
+    def test_stopped_turn_resumes_its_claude_session(self):
+        self.run_turn(self.thread, self.request('first'))
+        path = self.runtime.directory / (self.thread + '.json')
+        state = json.loads(path.read_text())
+        state.update(status='interrupted', started=True, request='other')
+        native.atomic_json(path, state)
+        second = self.request('first')
+        second['input'] = [*second['input'], {'role': 'user', 'content': 'next'}]
+        self.run_turn(self.thread, second)
+        call = json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(call['args'][call['args'].index('--resume') + 1], state['session_id'])
+
+    def test_compaction_marker_resumes_even_after_a_model_switch(self):
+        self.run_turn(self.thread, self.request('first'))
+        session = json.loads((self.runtime.directory / (self.thread + '.json')).read_text())['session_id']
+        self.runtime.bind(self.thread, self.root, model=native.FABLE)
+        compacted = {**self.request('x'), 'model': native.FABLE, 'input': [
+            {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': native.session_marker(session)}]},
+            {'role': 'user', 'content': 'after compaction'}]}
+        self.run_turn(self.thread, compacted)
+        call = json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(call['args'][call['args'].index('--resume') + 1], session)
+        self.assertEqual(call['args'][call['args'].index('--model') + 1], native.FABLE)
+
+    def test_reported_context_stays_under_codex_compaction(self):
+        _, usage = self.runtime.infer(self.thread, self.request('HUGE STREAM'), lambda text, kind='message': None, lambda: False)
+        self.assertEqual(usage['input_tokens'], native.REPORTED_CONTEXT_LIMIT)
 
     def test_run_not_on_subscription_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'apiKeySource=ANTHROPIC_API_KEY'):

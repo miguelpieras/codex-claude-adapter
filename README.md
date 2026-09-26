@@ -2,7 +2,7 @@
 
 Run **Claude Opus 5.5** and **Claude Fable 5.1** in a separate Codex desktop mode, using your authenticated local Claude Code subscription. Regular Codex keeps its normal settings, tasks, voice, and model picker.
 
-The standalone service leaves the official Codex app and its app-server process chain intact. Claude owns its native tools, permissions (Auto by default), and native Agent subagents. Browser and selected task tools return through Codex's ordinary Responses tool loop.
+The standalone service leaves the official Codex app and its app-server process chain intact. Claude keeps its own file tools, permission modes and native Agent subagents. Shell commands, the browser and selected task tools run in Codex through its ordinary Responses tool loop, so Codex shows them as its own rows.
 
 **macOS, experimental.** The current desktop smoke passed real task list/read/wait/message calls, the in-app browser, and a native Opus subagent. Fable Ultra was verified as Claude `ultracode`. See [verification and boundaries](STANDALONE.md).
 
@@ -52,21 +52,23 @@ Unknown models and missing attribution are rejected. Codex's own reviewer reques
 
 ## What you see while Claude works
 
-- Claude's thinking streams live into Codex's status line and is kept in the transcript as a **Thinking** quote (Claude Code's `--thinking-display summarized`; a model may not think on simple steps).
-- Each tool call appears in a running list, e.g. `**Bash** npm test`, `**Read** src/app.ts`, `[Review API] **Grep** TODO` for a subagent, and `Blocked by permissions: …` when a check stops one. The list names the requested call; Claude's native tools cannot appear as Codex's own "Ran command" rows.
+- Shell commands (Claude's and its subagents') run in Codex, so they appear as Codex's own rows ("Ran …", "Read files", "Listed files") with live output.
+- Claude's thinking and current action stream into Codex's live status line, as in native Codex (`--thinking-display summarized`; a model may not think on simple steps).
+- Claude's own file tools appear as one short line per burst in Codex's wording, e.g. "Read 4 files, edited `app.ts`, started agent **Audit billing**", and each subagent gets one "Agent … finished: …" line. `Blocked by permissions: …` marks a stopped call.
 - Claude's interim notes appear as progress text. After the final answer, Codex folds all of this under "Worked for …".
 - Real `response.in_progress` events every 10 seconds keep Codex's 300-second idle timeout from dropping long silent steps.
 
 ## Tools and permissions
 
-- Codex's permission picker selects Claude's permission mode for native tools and native Agent subagents:
-  - **Ask for approval** runs Claude's `manual` mode. Each Claude permission prompt appears as a Codex question with the full request (the whole Bash command, or every input field for other tools): Allow, Deny, or a free-form reply that Claude receives as the reason for the denial. A request longer than 4,000 characters is denied rather than shown truncated. A question waits up to an hour. The Claude profile enables `features.default_mode_request_user_input` for this. Without a way to ask, prompts are denied. Stopping a task while a question is open ends that Claude run, and your next message starts fresh.
-  - **Approve for me** runs Claude's `auto` mode: Claude's classifier approves or blocks each action. When Codex reviews a forwarded browser or task tool call, the adapter answers that review with a tool-less call to the task's Claude model.
-  - **Full access** runs Claude's `bypassPermissions` mode with no permission checks.
-  - Read-only side chats always use `auto` with Read/Glob/Grep only.
+- Shell commands go through Codex's `exec_command`/`write_stdin` (Claude's Bash and Monitor are turned off), so Codex's sandbox and approval rules govern them. Claude's own tools (Read, Edit, Write, WebFetch, Agent…) follow Claude's permission mode. Codex's permission picker sets both:
+  - **Ask for approval:** commands run in Codex's workspace sandbox; Codex shows its own approval card when one needs more (for example escalation or a risky command). Claude's own tools run in Claude's `manual` mode: each Claude permission prompt appears as a Codex question with the full request (every input field): Allow, Deny, or a free-form reply that Claude receives as the reason for the denial. A request longer than 4,000 characters is denied rather than shown truncated. Questions and approval cards wait up to an hour. The Claude profile enables `features.default_mode_request_user_input` for this. Without a way to ask, prompts are denied.
+  - **Approve for me:** commands run in the sandbox and escalations go to Codex's reviewer, which the adapter answers with a tool-less call to the task's Claude model. Claude's own tools run in Claude's `auto` mode.
+  - **Full access:** Codex runs commands without sandbox or approvals; Claude's own tools run in `bypassPermissions` mode.
+  - Read-only side chats always use `auto` with Read/Glob/Grep only and no shell.
+- Pressing Stop in Codex, even while a command or approval card is pending, ends that Claude run: the adapter watches the task's Codex log for the stop, and a new message also replaces a waiting run. The next message resumes the same Claude session.
 - Codex's OS sandbox does not contain native Claude tools. Turns with the Codex relay run Claude in normal mode with hooks disabled and the relay as the only MCP server; your user-level Claude Code settings and plugins load, repository settings do not. Claude's `--restricted` mode is not used: it strips Bash, WebFetch and Workflow and refuses bypass. Turns without the relay use `--safe-mode`. Read-only tasks use only Read/Glob/Grep, without browser access or native subagents.
 - Claude cannot take new input mid-run. A message you send while Claude waits on a Codex tool is kept for Claude's next turn, and a note says so.
-- The relay exposes `cua_repl.js`/`js_reset` and task `list_threads`, `read_thread`, `wait_threads`, and `send_message_to_thread` when the host provides them. Other Codex connectors and task-management tools are not currently forwarded.
+- The relay exposes Codex's `exec_command` and `write_stdin`, `cua_repl.js`/`js_reset`, and task `list_threads`, `read_thread`, `wait_threads`, and `send_message_to_thread` when the host provides them. Other Codex connectors and task-management tools are not currently forwarded. One Codex tool call runs at a time per task, so parallel subagents' commands queue.
 - Forwarded tools execute through the official Codex core and its permission checks. Host approvals may still require user input.
 - Messages can start work only in a local Claude-mode task already using the same selected model. Remote or differently modeled targets are refused. Reading and waiting do not start inference.
 - Separate Claude tasks can run concurrently. Native subagents within one task share that task's browser REPL and must coordinate tabs and variable names.
@@ -114,7 +116,7 @@ Voice is unavailable in Claude mode. Use regular Codex for voice. Audio/file att
 
 Claude mode advertises Claude's real 1,000,000-token context window and reports each turn's last Claude API call as the context in use, so Codex does not compact needlessly. Claude Code keeps and compacts the full context in its own session. If Codex still compacts its copy of the history (automatically or on request), the adapter answers without a model call and leaves a session marker, and the next turn resumes the same Claude session. Codex memories are turned off in the Claude profile because they run on an OpenAI model.
 
-Failed/interrupted native requests are not automatically replayed, avoiding repeated tool side effects. An active HTTP disconnect stops native execution. When Codex is executing a forwarded tool, a missing continuation expires after 120 seconds; an already-dispatched host action may still finish. Stop the service to cancel all native sessions immediately.
+Failed/interrupted native requests are not automatically replayed, avoiding repeated tool side effects. An active HTTP disconnect stops native execution. When Codex is executing a forwarded tool, a missing continuation expires after an hour for a command that may be awaiting an approval card, 6 minutes for `write_stdin`, and 2 minutes otherwise; an already-dispatched host action may still finish. Stop the service to cancel all native sessions immediately.
 
 ## Development
 

@@ -52,7 +52,7 @@ The initial isolated launch used a deeply nested workspace path, exceeding macOS
 - Forwarded browser/task calls retain host permissions. The adapter refuses host model-based review requirements; it does not promise every host action will auto-approve.
 - Only browser and list/read/wait/message tools are forwarded. Native Claude Agent handles subagents; Codex's host subagent tools are not forwarded.
 - Voice is unavailable in Claude mode; regular Codex retains voice. No claim is made that every background feature of the desktop is intercepted by this provider.
-- An already-dispatched host action can finish after cancellation. Pending host continuations expire after 120 seconds. Interrupted native requests require a new user message rather than automatic replay.
+- An already-dispatched host action can finish after cancellation. Pending host continuations expire after 2 minutes, 6 minutes for `write_stdin`, or an hour for a shell command that may be awaiting a Codex approval card; a Stop recorded in the task's Codex log ends the wait. Interrupted native requests require a new user message rather than automatic replay; that message resumes the same Claude session.
 - No edits were made to the official app bundle, signatures, standard Codex configuration, or standard task providers for this standalone setup.
 
 Official reference: [custom provider and model-catalog configuration](https://learn.chatgpt.com/docs/config-file/config-reference). Local app/CLI behavior, rather than CLI profile documentation alone, established the actual desktop launch path.
