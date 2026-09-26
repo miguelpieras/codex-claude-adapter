@@ -46,6 +46,13 @@ if 'STREAM' in json.dumps(request):
   {'type':'system','subtype':'permission_denied','tool_name':'Write'},
   {'type':'assistant','message':{'content':[{'type':'text','text':final}]},'parent_tool_use_id':None}]:
   print(json.dumps(e),flush=True)
+if 'AGENTS' in json.dumps(request):
+ for e in [{'type':'assistant','message':{'content':[{'type':'tool_use','name':'Agent','id':'ag1','input':{'description':'Audit billing','prompt':'x'}}]},'parent_tool_use_id':None},
+  {'type':'assistant','message':{'content':[{'type':'tool_use','name':'Read','id':'r1','input':{'file_path':'/w/src/refunds.ts'}}]},'parent_tool_use_id':'ag1','task_description':'Audit billing'},
+  {'type':'assistant','message':{'content':[{'type':'tool_use','name':'mcp__codex_browser__js','id':'b1','input':{'code':'1'}}]},'parent_tool_use_id':None},
+  {'type':'system','subtype':'task_notification','tool_use_id':'ag1','status':'completed'},
+  {'type':'assistant','message':{'content':[{'type':'text','text':final}]},'parent_tool_use_id':None}]:
+  print(json.dumps(e),flush=True)
 print(json.dumps({'type':'result','is_error':False,'result':final, 'modelUsage':{sys.argv[sys.argv.index('--model')+1]:{}},'usage':{'input_tokens':10,'output_tokens':10},'permission_denials':[]}))
 '''
 
@@ -83,21 +90,22 @@ class StreamTests(unittest.TestCase):
 
     def test_progress_items_are_well_formed_and_closed(self):
         def run(stream):
-            stream.emit('Plan', 'thinking'); stream.emit(' more', 'thinking'); stream.emit('Plan more', 'thinking_done')
-            stream.emit('- Ran `ls`', 'action'); stream.emit('- Read `a`', 'action')
-            stream.emit('note'); stream.emit('- Ran `x`', 'action')
-            stream.emit('', 'thinking_done')  # hidden thinking adds no empty item
+            stream.emit('Plan', 'thinking'); stream.emit(' more', 'thinking'); stream.emit('', 'thinking_done')
+            stream.emit('Running ls', 'status'); stream.emit('Reading a', 'status')
+            stream.emit('Ran `ls`, read `a`')
+            stream.emit('Scan: Searching for x', 'status'); stream.emit('next thought', 'thinking')
+            stream.emit('', 'thinking_done')
+            stream.emit('', 'thinking_done')  # nothing open: no empty item
             stream.finish('answer', {})
         events = self.events(run)
         added = [e['item'] for e in events if e['type'] == 'response.output_item.added']
         done = [e['item'] for e in events if e['type'] == 'response.output_item.done']
         self.assertEqual([i['id'] for i in added], [i['id'] for i in done])
-        self.assertEqual([i['type'] for i in done], ['reasoning', 'message', 'message', 'message', 'message'])
-        self.assertEqual(done[0]['summary'], [{'type': 'summary_text', 'text': 'Plan more'}])
-        self.assertEqual(done[1]['content'][0]['text'], '- Ran `ls`\n- Read `a`')
-        self.assertEqual([i['phase'] for i in done[1:]], ['commentary', 'commentary', 'commentary', 'final_answer'])
-        deltas = [e['delta'] for e in events if e['type'] == 'response.reasoning_summary_text.delta']
-        self.assertEqual(''.join(deltas), 'Plan more')
+        self.assertEqual([i['type'] for i in done], ['reasoning', 'reasoning', 'message', 'reasoning', 'message'])
+        self.assertEqual([i['summary'][0]['text'] for i in done if i['type'] == 'reasoning'],
+                         ['Plan more', 'Running ls\n\nReading a', 'Scan: Searching for x\n\nnext thought'])
+        self.assertEqual([(i['phase'], i['content'][0]['text']) for i in done if i['type'] == 'message'],
+                         [('commentary', 'Ran `ls`, read `a`'), ('final_answer', 'answer')])
         completed = next(e for e in events if e['type'] == 'response.completed')['response']
         self.assertEqual(completed['output'], done)
 
@@ -165,18 +173,40 @@ class NativeTests(unittest.TestCase):
         self.runtime.infer(self.thread, self.request('STREAM'), lambda text, kind='message': seen.append((kind, text)),
                            lambda: False)
         self.assertEqual(seen, [
-            ('action', '- **Read** `fixture.txt`'),
+            ('status', 'Reading fixture.txt'),       # live line while tools run
+            ('message', 'Read `fixture.txt`'),       # one compact line per burst of tool calls
             ('thinking', 'Plan: '), ('thinking', 'read files'),
-            ('thinking_done', ''),                    # deltas already carried the text
-            ('message', native.quote('Plan: read files')),
-            ('message', 'Looking around.'),          # interim text, flushed by the next action
-            ('action', '- **Bash** `npm test`'),
-            ('action', '- [Scan] **Grep** `TODO`'),  # subagent action; subagent thinking stays out
-            ('action', '- Blocked by permissions: **Write**')])  # final text is the answer, not commentary
+            ('thinking_done', ''),                   # deltas already carried the text; no quote block
+            ('message', 'Looking around.'),          # interim text, flushed by the next tool call
+            ('status', 'Running npm test'),
+            ('status', 'Scan: Searching for TODO'),  # subagent activity only in the live line
+            ('message', 'Blocked by permissions: Write'),
+            ('message', 'Ran `npm test`'),
+            ('message', 'Agent **Scan** worked: searched for `TODO`')])  # final text is the answer
         args = json.loads((self.root / 'calls.jsonl').read_text())['args']
         self.assertEqual(args[args.index('--thinking-display') + 1], 'summarized')
         self.assertIn('--include-partial-messages', args)
         self.assertEqual(args[args.index('--setting-sources') + 1], 'user')
+
+    def test_subagent_lifecycle_and_codex_run_tools(self):
+        seen = []
+        self.runtime.infer(self.thread, self.request('AGENTS'), lambda text, kind='message': seen.append((kind, text)),
+                           lambda: False)
+        self.assertEqual(seen, [
+            ('status', 'Reading fixture.txt'),
+            ('status', 'Starting agent Audit billing'),
+            ('status', 'Audit billing: Reading refunds.ts'),
+            ('message', 'Read `fixture.txt`, started agent **Audit billing**'),
+            ('message', 'Agent **Audit billing** finished: read `refunds.ts`')])  # browser call: Codex shows it natively
+
+    def test_burst_summary_uses_codex_wording(self):
+        tally = native.Tally()
+        for call in [('read', 'Read', 'a.ts'), ('read', 'Read', 'a.ts'), ('read', 'Read', 'b.ts'),
+                     ('command', 'Bash', 'npm test'), ('search', 'Grep', 'TODO'), ('search', 'Grep', 'FIXME'),
+                     ('agent', 'Agent', 'Audit billing'), ('other', 'TodoWrite', None)]:
+            tally.add(*call)
+        self.assertEqual(tally.summary(), 'Read 2 files, ran 2 searches, ran `npm test`, '
+                                          'started agent **Audit billing**, used TodoWrite')
 
     def test_run_not_on_subscription_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'apiKeySource=ANTHROPIC_API_KEY'):
@@ -186,22 +216,22 @@ class NativeTests(unittest.TestCase):
         other = str(uuid.uuid4())
         self.runtime.bind(other, self.root)
         thinking = {'type': 'message', 'role': 'assistant', 'phase': 'commentary',
-                    'content': [{'type': 'output_text', 'text': native.quote('secret plan')}]}
+                    'content': [{'type': 'output_text', 'text': native.THINKING_QUOTE + '\n>\n> secret plan'}]}
         progress = {'type': 'message', 'role': 'assistant', 'phase': 'commentary',
-                    'content': [{'type': 'output_text', 'text': '- **Bash** `ls`'}]}
+                    'content': [{'type': 'output_text', 'text': 'Ran `ls`'}]}
         request = self.request('fresh')
         request['input'] = [*request['input'], {'type': 'reasoning', 'id': 'rs_1', 'summary': []}, thinking, progress]
         self.run_turn(other, request)
         sent = json.loads((self.root / 'calls.jsonl').read_text().splitlines()[-1])['request']
         self.assertFalse(sent['continuation'])
         self.assertEqual([i.get('type') or i.get('role') for i in sent['input']], ['user', 'message'])
-        self.assertEqual(sent['input'][1]['content'][0]['text'], '- **Bash** `ls`')
+        self.assertEqual(sent['input'][1]['content'][0]['text'], 'Ran `ls`')
 
     def test_resumed_turn_does_not_replay_streamed_progress(self):
         first = self.request('first')
         self.run_turn(self.thread, first)
         progress = [{'type': 'reasoning', 'id': 'rs_1', 'summary': [], 'content': None, 'encrypted_content': None},
-                    {'type': 'message', 'role': 'assistant', 'phase': 'commentary', 'content': [{'type': 'output_text', 'text': '- Ran `ls`'}]},
+                    {'type': 'message', 'role': 'assistant', 'phase': 'commentary', 'content': [{'type': 'output_text', 'text': 'Ran `ls`'}]},
                     {'type': 'message', 'role': 'assistant', 'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': 'CLAUDE_FIXTURE'}]}]
         second = {**first, 'input': [*first['input'], *progress, {'role': 'user', 'content': 'next'}]}
         self.run_turn(self.thread, second)

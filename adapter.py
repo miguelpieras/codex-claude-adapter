@@ -69,16 +69,9 @@ class Stream:
         self.event('response.created', response=self.response)
 
     def emit(self, text, kind='message'):
-        """Native progress: 'message' commentary, 'action' list line, 'thinking' delta, 'thinking_done' full text."""
-        if kind == 'action':
-            if not self.open or self.open['kind'] != 'action':
-                self.close_open()
-                self.start('action', {'type': 'message', 'id': 'msg_' + uuid.uuid4().hex, 'role': 'assistant',
-                                      'phase': 'commentary', 'status': 'in_progress', 'content': []})
-                self.event('response.content_part.added', **self.open['common'],
-                           part={'type': 'output_text', 'text': '', 'annotations': []})
-            self.delta(text + '\n')
-        elif kind in ('thinking', 'thinking_done'):
+        """Native progress: 'message' commentary; 'thinking' delta, 'thinking_done' full text and
+        'status' line all feed a reasoning item, which Codex shows only as its live status line."""
+        if kind in ('thinking', 'thinking_done', 'status'):
             reasoning_open = bool(self.open) and self.open['kind'] == 'reasoning'
             if kind == 'thinking_done' and not text and not reasoning_open:
                 return  # hidden thinking: an empty reasoning item would render nothing
@@ -87,13 +80,20 @@ class Stream:
                 self.start('reasoning', {'type': 'reasoning', 'id': 'rs_' + uuid.uuid4().hex, 'summary': []})
                 self.event('response.reasoning_summary_part.added', **self.open['common'],
                            part={'type': 'summary_text', 'text': ''})
-            if kind == 'thinking':
-                self.delta(text)
+            # Codex's live line shows the last line of the summary, so status lines and
+            # thinking start on their own line after each other.
+            gap = '\n\n' if self.open['text'] and (kind == 'status' or self.open.get('last') == 'status') else ''
+            if kind == 'status':
+                self.delta(gap + text)
+            elif kind == 'thinking':
+                self.delta(gap + text)
             else:
-                # Add only what the live deltas missed; never repeat streamed text.
-                if text.startswith(self.open['text']) and len(text) > len(self.open['text']):
-                    self.delta(text[len(self.open['text']):])
+                # A non-empty whole block means no live deltas carried it (native sends '' then).
+                if text:
+                    self.delta(text[len(self.open['text']):] if text.startswith(self.open['text']) else gap + text)
                 self.close_open()
+                return
+            self.open['last'] = kind
         else:
             self.close_open()
             self.message(text)
@@ -210,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
             metadata = self.headers.get('x-codex-turn-metadata') or (data.get('client_metadata') or {}).get('x-codex-turn-metadata')
             # This legacy wrapper shares ~/.codex tasks with OpenAI models, which must never
             # receive locally made reasoning items; thinking reaches it as quoted commentary only.
-            emit = lambda text, kind='message': None if kind in ('thinking', 'thinking_done') else stream.emit(text, kind)
+            emit = lambda text, kind='message': None if kind in ('thinking', 'thinking_done', 'status') else stream.emit(text, kind)
             final, usage = self.server.native.infer(thread_id, data, emit, stream.cancelled,
                                                    browser_metadata=metadata)
             stream.finish(final, usage)

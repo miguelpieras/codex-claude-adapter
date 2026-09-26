@@ -37,11 +37,11 @@ def main():
                 'reasoning': {'effort': 'low'}}, lambda text, kind='message': events.append((kind, text)), lambda: False)
             end = time.monotonic()
             assert (cwd / 'result.txt').read_text().strip() == 'adapter-native-' + str(i)
-            actions = [v for k, v in events if k == 'action']
-            assert any(v.startswith('- **Read**') for v in actions), events
-            assert any(v.startswith('- **Write**') for v in actions), events
+            actions = [v for k, v in events if k == 'status']
+            assert any(v.startswith('Reading') for v in actions), events
+            assert any(v.startswith('Editing') for v in actions), events
             if i == 0:
-                assert any(v.startswith('- **Agent**') for v in actions), events
+                assert any(v.startswith('Starting agent') for v in actions), events
             spans.append((start, end))
             return {'task': i, 'verified_file': True, 'native_tools': actions,
                     'model': MODEL, 'answer': final, 'seconds': round(end-start, 2)}

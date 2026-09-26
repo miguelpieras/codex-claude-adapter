@@ -21,19 +21,27 @@ PERMISSIONS = ('auto', 'manual', 'bypassPermissions')
 # Only the user's own Claude settings; a repository's .claude/settings*.json must not
 # change permissions, credentials or endpoints for Claude-mode turns.
 SETTINGS = ('--setting-sources', 'user')
-THINKING_QUOTE = '> **Thinking**'
-# Tool name -> input field shown in the action list. Lines name the requested tool call;
-# they do not claim it ran (a permission check may still block it).
-ACTIONS = {'Bash': 'command', 'Read': 'file_path', 'Edit': 'file_path', 'MultiEdit': 'file_path',
-           'Write': 'file_path', 'NotebookEdit': 'notebook_path', 'Grep': 'pattern', 'Glob': 'pattern',
-           'WebFetch': 'url', 'WebSearch': 'query', 'Agent': 'description', 'Task': 'description'}
+THINKING_QUOTE = '> **Thinking**'  # quoted thinking from older adapter versions, still in task history
+RELAYED = 'mcp__codex_browser__'  # tools Codex runs itself and already shows as native rows
+# Tool name -> (kind, input field). Kinds mirror Codex's own row wording.
+KINDS = {'Bash': ('command', 'command'), 'Read': ('read', 'file_path'), 'Edit': ('edit', 'file_path'),
+         'MultiEdit': ('edit', 'file_path'), 'Write': ('edit', 'file_path'), 'NotebookEdit': ('edit', 'notebook_path'),
+         'Grep': ('search', 'pattern'), 'Glob': ('list', 'pattern'), 'WebSearch': ('web', 'query'),
+         'WebFetch': ('fetch', 'url'), 'Agent': ('agent', 'description'), 'Task': ('agent', 'description')}
+LIVE = {'command': 'Running', 'read': 'Reading', 'edit': 'Editing', 'search': 'Searching for', 'list': 'Listing',
+        'web': 'Searching the web for', 'fetch': 'Fetching', 'agent': 'Starting agent'}
+
+
+def short(text, limit=80):
+    """First line of a tool input, trimmed for one-line display."""
+    lines = str(text).strip().splitlines() or ['']
+    text = lines[0] if len(lines) == 1 else lines[0] + ' …'
+    return text if len(text) <= limit else text[:limit - 1] + '…'
 
 
 def code(text):
     """Inline markdown code that survives backticks in the text."""
-    lines = text.strip().splitlines() or ['']
-    text = lines[0] if len(lines) == 1 else lines[0] + ' …'
-    text = text if len(text) <= 160 else text[:159] + '…'
+    text = short(text)
     run, longest = 0, 0
     for char in text:
         run = run + 1 if char == '`' else 0
@@ -43,19 +51,60 @@ def code(text):
     return fence + pad + text + pad + fence
 
 
-def describe(block, event):
-    """One visible label for a Claude tool call, e.g. "**Bash** `npm test`"."""
+def classify(block):
+    """(kind, tool name, shown value) for a Claude tool call."""
     name, args = str(block.get('name') or 'tool'), block.get('input') or {}
-    value = args.get(ACTIONS.get(name, ''))
-    label = '**' + name + '**' + (' ' + code(value) if isinstance(value, str) and value.strip() else '')
-    if event.get('parent_tool_use_id'):
-        label = '[' + str(event.get('task_description') or 'agent') + '] ' + label
-    return label
+    kind, field = KINDS.get(name, ('other', None))
+    value = args.get(field) if field else None
+    value = value.strip() if isinstance(value, str) and value.strip() else None
+    if value and kind in ('read', 'edit'):
+        value = Path(value).name or value
+    return kind, name, value
 
 
-def quote(text):
-    lines = [THINKING_QUOTE[2:], ''] + text.strip().splitlines()
-    return '\n'.join('> ' + line if line.strip() else '>' for line in lines)
+def live(kind, name, value):
+    """Present-tense status for Codex's live line, e.g. "Running npm test"."""
+    verb = LIVE.get(kind, 'Using ' + name)
+    return verb + (' ' + short(value, 60) if value else '')
+
+
+class Tally:
+    """Tool calls in one burst, summarized the way Codex titles its row groups."""
+    ORDER = ('read', 'search', 'list', 'command', 'edit', 'web', 'fetch', 'agent', 'other')
+
+    def __init__(self):
+        self.items = {}
+
+    def __bool__(self):
+        return bool(self.items)
+
+    def add(self, kind, name, value):
+        values = self.items.setdefault(kind, [])
+        entry = name if kind == 'other' else value or name
+        if kind not in ('read', 'edit', 'other') or entry not in values:
+            values.append(entry)
+
+    def summary(self):
+        parts = []
+        for kind in self.ORDER:
+            values, n = self.items.get(kind, []), len(self.items.get(kind, []))
+            if not n:
+                continue
+            one = values[0]
+            parts.append({
+                'read': 'read ' + (code(one) if n == 1 else str(n) + ' files'),
+                'search': 'searched for ' + code(one) if n == 1 else 'ran ' + str(n) + ' searches',
+                'list': 'listed ' + code(one) if n == 1 else 'listed files ' + str(n) + ' times',
+                'command': 'ran ' + (code(one) if n == 1 else str(n) + ' commands'),
+                'edit': 'edited ' + (code(one) if n == 1 else str(n) + ' files'),
+                'web': 'searched the web for ' + code(one) if n == 1 else 'ran ' + str(n) + ' web searches',
+                'fetch': 'fetched ' + (code(one) if n == 1 else str(n) + ' pages'),
+                'agent': ('started agent **' + short(one, 50) + '**' if n == 1 else
+                          'started ' + str(n) + ' agents: ' + ', '.join('**' + short(v, 40) + '**' for v in values)),
+                'other': 'used ' + ', '.join(values),
+            }[kind])
+        text = ', '.join(parts)
+        return text[:1].upper() + text[1:]
 
 def claude_effort(model, effort=None):
     if model not in MODELS:
@@ -332,8 +381,10 @@ class NativeRuntime:
             process.stdin.close()
             result = None
             denials = []
-            labels = {}  # tool_use_id -> action label, to name blocked calls
+            labels = {}  # tool_use_id -> short label, to name blocked calls
             streamed = False  # main-thread thinking already delivered as live deltas
+            burst = Tally()  # main-thread tool calls since Claude last wrote or thought
+            agents = {}  # Agent tool_use_id -> [description, Tally of that subagent's calls]
             # Claude sends one content block per event. The latest main-thread text is
             # interim commentary unless it turns out to be the final answer (result.result).
             pending = None
@@ -342,6 +393,17 @@ class NativeRuntime:
                 if pending:
                     emit(pending)
                 pending = None
+            def close_burst():
+                nonlocal burst
+                if burst:
+                    emit(burst.summary())
+                burst = Tally()
+            def agent_line(tool_use_id, status='finished'):
+                close_burst()  # "started agent …" before "Agent … finished"
+                description, tally = agents.pop(tool_use_id)
+                summary = tally.summary()
+                emit('Agent **' + short(description, 60) + '** ' + status +
+                     (': ' + summary[:1].lower() + summary[1:] if summary else ''))
             while True:
                 if cancelled():
                     self.cancel(thread_id)
@@ -367,32 +429,49 @@ class NativeRuntime:
                     delta = (event.get('event') or {}).get('delta') or {}
                     if delta.get('type') == 'thinking_delta' and delta.get('thinking'):
                         flush()
+                        close_burst()
                         streamed = True
                         emit(delta['thinking'], 'thinking')
                 elif kind == 'assistant':
                     for block in (event.get('message') or {}).get('content') or []:
                         if block.get('type') == 'thinking' and main:
                             flush()
-                            thought = block.get('thinking') or ''
-                            # Whole block after live deltas only closes the live item.
-                            emit('' if streamed else thought, 'thinking_done')
+                            close_burst()
+                            # Thinking lives in Codex's live line, as in native Codex. A whole
+                            # block after live deltas only closes the live item.
+                            emit('' if streamed else block.get('thinking') or '', 'thinking_done')
                             streamed = False
-                            if thought.strip():
-                                emit(quote(thought))
-                        elif block.get('type') == 'tool_use':
+                        elif block.get('type') == 'tool_use' and not str(block.get('name')).startswith(RELAYED):
+                            tool, name, value = classify(block)
+                            labels[block.get('id')] = name + (' ' + code(value) if value else '')
                             if main:
                                 flush()
-                            labels[block.get('id')] = describe(block, event)
-                            emit('- ' + labels[block.get('id')], 'action')
+                                burst.add(tool, name, value)
+                                if tool == 'agent':
+                                    agents[block.get('id')] = [value or 'agent', Tally()]
+                                emit(live(tool, name, value), 'status')
+                            else:
+                                owner = agents.setdefault(event['parent_tool_use_id'],
+                                                          [event.get('task_description') or 'agent', Tally()])
+                                owner[1].add(tool, name, value)
+                                emit(short(owner[0], 40) + ': ' + live(tool, name, value), 'status')
                         elif block.get('type') == 'text' and main and (block.get('text') or '').strip():
                             flush()
+                            close_burst()
                             pending = block['text']
                 elif kind == 'system' and event.get('subtype') == 'permission_denied':
-                    blocked = labels.get(event.get('tool_use_id')) or '**' + str(event.get('tool_name') or 'tool') + '**'
-                    emit('- Blocked by permissions: ' + blocked, 'action')
+                    emit('Blocked by permissions: ' + (labels.get(event.get('tool_use_id')) or
+                                                       str(event.get('tool_name') or 'a tool')))
+                elif kind == 'system' and event.get('subtype') == 'task_notification' and event.get('tool_use_id') in agents:
+                    status = event.get('status')
+                    agent_line(event['tool_use_id'], 'finished' if status in (None, 'completed') else str(status))
                 elif kind == 'result':
                     result = event
                     denials += event.get('permission_denials') or []
+            close_burst()
+            for tool_use_id in list(agents):
+                if agents[tool_use_id][1]:
+                    agent_line(tool_use_id, 'worked')
             process.wait(timeout=10)
             if not result or process.returncode or result.get('is_error'):
                 reason = str((result or {}).get('result', 'Claude Code did not finish successfully.'))

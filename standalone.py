@@ -421,7 +421,7 @@ class ServiceHandler(Handler):
                     kind, value = turn.events.get(timeout=.25)
                 except queue.Empty:
                     continue
-                if kind in ('message', 'action', 'thinking', 'thinking_done'):
+                if kind in ('message', 'status', 'thinking', 'thinking_done'):
                     stream.emit(value, kind)
                 elif kind == 'call':
                     stream.close_open()
