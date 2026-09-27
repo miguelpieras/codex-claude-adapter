@@ -454,10 +454,20 @@ class RelayTests(unittest.TestCase):
 
     def test_claude_failure_is_shown_as_the_answer(self):
         # Codex ignores a bare SSE error event and reports only "stream closed before response.completed".
-        limit = "You've hit your weekly limit · resets Oct 2 at 1am (Europe/Madrid)"
-        self.server.native.infer = Mock(side_effect=ValueError(limit))
+        self.server.native.infer = Mock(side_effect=ValueError('Claude Code did not finish successfully.'))
+        self.server.native.sign_in = Mock()
         answer = self.post(self.request)['output'][-1]
-        self.assertEqual((answer['phase'], answer['content'][0]['text']), ('final_answer', limit))
+        self.assertEqual((answer['phase'], answer['content'][0]['text']),
+                         ('final_answer', 'Claude Code did not finish successfully.'))
+        self.server.native.sign_in.assert_not_called()
+
+    def test_login_failure_opens_claude_sign_in(self):
+        limit = "You've hit your weekly limit · resets Oct 2 at 1am (Europe/Madrid)"
+        self.server.native.infer = Mock(side_effect=native.LoginError(limit))
+        self.server.native.sign_in = Mock(return_value='Sign-in page is open.')
+        answer = self.post(self.request)['output'][-1]
+        self.assertEqual(answer['content'][0]['text'], limit + '\n\nSign-in page is open.')
+        self.server.native.sign_in.assert_called_once()
 
     def test_message_to_openai_or_unverified_target_is_rejected(self):
         turn = service.Turn(self.tid, {**self.request, 'tools': [

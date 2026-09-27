@@ -170,6 +170,16 @@ def environment(model=MODEL):
     return env
 
 
+class LoginError(ValueError):
+    """Claude Code's saved login cannot run turns (signed out, expired or out of usage).
+    Signing in again, possibly with another account, can fix it."""
+
+
+# Claude Code's codes for failed API calls that another login can fix.
+LOGIN_ERRORS = ('authentication_failed', 'billing_error', 'rate_limit')
+LOGIN_WAIT = 600  # seconds an opened sign-in page waits for the user
+
+
 def check_auth(cwd):
     if not CLAUDE.is_file():
         raise ValueError('Install Claude Code and log in with your Claude subscription, or set CODEX_ADAPTER_CLAUDE to its executable.')
@@ -182,7 +192,7 @@ def check_auth(cwd):
     if (run.returncode or not auth.get('loggedIn') or auth.get('authMethod') != 'claude.ai'
             or auth.get('apiProvider') != 'firstParty'
             or auth.get('subscriptionType') not in ('max', 'pro', 'team', 'enterprise')):
-        raise ValueError('Sign into local Claude Code with your Claude subscription. API fallback is disabled.')
+        raise LoginError('Sign into local Claude Code with your Claude subscription. API fallback is disabled.')
 
 
 def stop(process):
@@ -257,6 +267,7 @@ class NativeRuntime:
         self.browser = None
         self.system = system
         self.inline_images = inline_images
+        self.login = None  # `claude auth login` waiting for the user in the browser
 
     def bind(self, thread_id, cwd, *, readonly=False, model=MODEL, effort=None, permission='auto'):
         uuid.UUID(thread_id)
@@ -283,6 +294,27 @@ class NativeRuntime:
             self.cancel(thread_id)
         for process in list(self.reviews):
             stop(process)
+        if self.login:
+            stop(self.login)
+
+    def sign_in(self):
+        """Open Claude's sign-in page, one at a time. Claude Code saves the login itself once the
+        user approves in the browser; later turns run on the account chosen there."""
+        with self.guard:
+            if not (self.login and self.login.poll() is None):
+                try:
+                    # Input stays open: at end of input Claude Code would stop waiting for the browser.
+                    self.login = subprocess.Popen([str(CLAUDE), *SETTINGS, '--safe-mode', '--strict-mcp-config',
+                        'auth', 'login', '--claudeai'], cwd=Path.home(), env=environment(), stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                except OSError:
+                    return 'Run `claude auth login` in a terminal to choose the account Claude mode uses.'
+                timer = threading.Timer(LOGIN_WAIT, stop, [self.login])
+                timer.daemon = True
+                timer.start()
+        return ("Claude mode uses the account signed in to Claude Code's `claude` command, which can differ from the "
+                "Claude app's. Claude's sign-in page is open in your browser: choose the account to use there, "
+                'then send your message again.')
 
     def infer(self, thread_id, request, emit, cancelled, *, browser_metadata=None):
         model = request.get('model')
@@ -418,6 +450,7 @@ class NativeRuntime:
             except (BrokenPipeError, ConnectionResetError):  # cancelled or exited before reading
                 raise ValueError('Claude turn interrupted before Claude Code read the request.')
             result = None
+            failure = None  # Claude Code's code for a failed API call, e.g. 'rate_limit'
             denials = []
             labels = {}  # tool_use_id -> short label, to name blocked calls
             streamed = False  # main-thread thinking already delivered as live deltas
@@ -484,6 +517,8 @@ class NativeRuntime:
                         streamed = True
                         emit(delta['thinking'], 'thinking')
                 elif kind == 'assistant':
+                    if main and event.get('error'):
+                        failure = event['error']
                     for block in (event.get('message') or {}).get('content') or []:
                         if block.get('type') == 'thinking' and main:
                             flush()
@@ -534,9 +569,10 @@ class NativeRuntime:
             process.wait(timeout=10)
             if not result or process.returncode or result.get('is_error'):
                 reason = str((result or {}).get('result', 'Claude Code did not finish successfully.'))
-                if 'revoked' in reason or '401' in reason:
+                expired = 'revoked' in reason or '401' in reason
+                if expired:
                     reason = 'Claude subscription login expired or was revoked. Run /login in Claude Code. No API fallback was attempted.'
-                raise ValueError(reason[:1000])
+                raise (LoginError if expired or failure in LOGIN_ERRORS else ValueError)(reason[:1000])
             models = set(result.get('modelUsage', {}))
             if not models or models != {model}:
                 raise ValueError('Claude did not confirm exclusive ' + model + ' task inference. Refusing a silent model fallback.')

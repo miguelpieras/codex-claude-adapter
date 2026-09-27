@@ -29,6 +29,9 @@ if 'auth' in sys.argv:
 request=json.loads(sys.stdin.read())
 if Path('deny-auth').exists():
  print(json.dumps({'type':'result','is_error':True,'result':'OAuth access token has been revoked'}));sys.exit(1)
+if Path('usage-limit').exists():
+ print(json.dumps({'type':'assistant','error':'rate_limit','message':{'content':[{'type':'text','text':'You have hit your weekly limit'}]}}))
+ print(json.dumps({'type':'result','is_error':True,'result':'You have hit your weekly limit'}));sys.exit(1)
 with Path('calls.jsonl').open('a') as f:f.write(json.dumps({'args':sys.argv,'envkeys':[k for k in os.environ if k.startswith(('ANTHROPIC_','OPENAI_','CLAUDE_'))],'subagent_model':os.environ.get('CLAUDE_CODE_SUBAGENT_MODEL'),'request':request})+'\\n')
 if 'SLOW' in json.dumps(request):time.sleep(1)
 model=sys.argv[sys.argv.index('--model')+1]
@@ -158,8 +161,23 @@ class NativeTests(unittest.TestCase):
 
     def test_auth_revocation_no_fallback(self):
         (self.root / 'deny-auth').touch()
-        with self.assertRaisesRegex(ValueError, 'No API fallback'):
+        with self.assertRaisesRegex(native.LoginError, 'No API fallback'):
             self.run_turn(self.thread, self.request())
+
+    def test_usage_limit_is_a_login_problem(self):
+        (self.root / 'usage-limit').touch()
+        with self.assertRaisesRegex(native.LoginError, 'weekly limit'):
+            self.run_turn(self.thread, self.request())
+
+    def test_sign_in_opens_one_login_page_at_a_time(self):
+        with patch.object(native.subprocess, 'Popen') as popen:
+            popen.return_value.poll.return_value = None  # still waiting for the browser
+            first, second = self.runtime.sign_in(), self.runtime.sign_in()
+        self.runtime.login = None
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(popen.call_args.args[0][-3:], ['auth', 'login', '--claudeai'])
+        self.assertIn('sign-in page', first)
+        self.assertEqual(first, second)
 
     def test_subscription_environment(self):
         with patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'fake', 'OPENAI_API_KEY': 'fake',

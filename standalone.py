@@ -498,6 +498,9 @@ class ServiceHandler(Handler):
                             lambda text, kind='message': turn.events.put((kind, text)), turn.stopped.is_set,
                             browser_metadata=metadata)
                         turn.events.put(('final', (final, usage)))
+                    except native.LoginError as error:
+                        # Another login can fix this, so open Claude's sign-in page instead of a dead end.
+                        turn.events.put(('error', str(error) + '\n\n' + self.server.native.sign_in()))
                     except Exception as error:
                         turn.events.put(('error', str(error)))
                     finally:
