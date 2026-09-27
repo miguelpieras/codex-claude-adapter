@@ -70,8 +70,44 @@ def select(original, directory):
         return executable(app)
     if is_running(app):
         raise RuntimeError('Codex updated. Close the Claude window before reopening its launcher.')
-    print('Codex updated: using the current official app. Re-enable the running icon to recolor it.')
+    try:
+        if repair(original, directory):
+            print('Codex updated: rebuilt the orange Claude app from the new version.')
+            return executable(app)
+    except Exception as error:
+        print('Codex updated, and the orange Claude app could not be rebuilt (' + str(error) + ').')
+    print('Using the current official app. Re-enable the running icon to recolor it.')
     return original
+
+
+def strays(directory):
+    """Codex's updater replaces the copy it runs from and renames it (for example ChatGPT.app)."""
+    found = []
+    for path in (directory / 'appearance').glob('*.app'):
+        if path == bundle(directory) or path.is_symlink() or not path.is_dir():
+            continue
+        try:
+            executable(path)  # only Codex app bundles
+        except (OSError, ValueError, RuntimeError):
+            continue
+        found.append(path)
+    return found
+
+
+def repair(original, directory):
+    """Rebuild the orange copy from the installed app with the saved icon (an APFS clone, so no
+    extra space) and drop the updater's renamed copy. False when there is nothing safe to do."""
+    app = bundle(directory)
+    icon = app.parent / 'icon.icns'
+    if not icon.is_file() or any(is_running(stray) for stray in strays(directory)):
+        return False
+    for stray in strays(directory):
+        shutil.rmtree(stray)
+    install(original, directory, icon)
+    from dock import dock_entries, is_our_tile, refresh_dock
+    if any(is_our_tile(entry, app) for entry in dock_entries()):
+        refresh_dock()  # the pinned tile showed "?" while the copy was missing
+    return True
 
 
 def install(original, directory, icon):

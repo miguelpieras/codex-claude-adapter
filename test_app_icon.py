@@ -1,4 +1,5 @@
 import plistlib
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,3 +58,43 @@ class AppIconTests(unittest.TestCase):
                 app_icon.remove(directory)
             self.assertFalse(appearance.exists())
             self.assertEqual(history.read_text(), 'keep')
+
+
+class AppIconUpdateTests(unittest.TestCase):
+    fixture = AppIconTests.fixture
+
+    def test_update_rebuilds_the_orange_copy_and_drops_the_updaters_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = self.fixture(root)
+            directory = root / 'profile'
+            (directory / 'appearance').mkdir(parents=True)
+            atomic_json(directory / 'appearance' / 'owner.json', {'owner': app_icon.OWNER, 'source': 'before-update'})
+            (directory / 'appearance' / 'icon.icns').write_bytes(b'icns fixture')
+            renamed = directory / 'appearance' / 'ChatGPT.app'  # what Codex's updater left behind
+            shutil.copytree(original, renamed)
+            rebuilt = lambda source, target, icon: shutil.copytree(original, app_icon.bundle(target))
+            with patch.object(app_icon, 'install', side_effect=rebuilt) as install, \
+                    patch.object(app_icon, 'verify'), patch.object(app_icon, 'is_running', return_value=False), \
+                    patch('dock.dock_entries', return_value=[]):
+                chosen = app_icon.select(app_icon.executable(original), directory)
+            self.assertEqual(chosen, app_icon.executable(app_icon.bundle(directory)))
+            self.assertFalse(renamed.exists())
+            self.assertEqual(install.call_args.args[2], directory / 'appearance' / 'icon.icns')
+
+    def test_update_never_removes_a_running_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = self.fixture(root)
+            directory = root / 'profile'
+            (directory / 'appearance').mkdir(parents=True)
+            atomic_json(directory / 'appearance' / 'owner.json', {'owner': app_icon.OWNER, 'source': 'before-update'})
+            (directory / 'appearance' / 'icon.icns').write_bytes(b'icns fixture')
+            renamed = directory / 'appearance' / 'ChatGPT.app'
+            shutil.copytree(original, renamed)
+            with patch.object(app_icon, 'install') as install, patch.object(app_icon, 'verify'), \
+                    patch.object(app_icon, 'is_running', side_effect=lambda app: app == renamed):
+                chosen = app_icon.select(app_icon.executable(original), directory)
+            self.assertEqual(chosen, app_icon.executable(original))
+            self.assertTrue(renamed.exists())
+            install.assert_not_called()
