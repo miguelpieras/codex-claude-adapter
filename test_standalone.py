@@ -452,6 +452,13 @@ class RelayTests(unittest.TestCase):
         finally:
             turn.http_lock.release()
 
+    def test_claude_failure_is_shown_as_the_answer(self):
+        # Codex ignores a bare SSE error event and reports only "stream closed before response.completed".
+        limit = "You've hit your weekly limit · resets Oct 2 at 1am (Europe/Madrid)"
+        self.server.native.infer = Mock(side_effect=ValueError(limit))
+        answer = self.post(self.request)['output'][-1]
+        self.assertEqual((answer['phase'], answer['content'][0]['text']), ('final_answer', limit))
+
     def test_message_to_openai_or_unverified_target_is_rejected(self):
         turn = service.Turn(self.tid, {**self.request, 'tools': [
             {'type': 'namespace', 'name': 'mcp__codex_app', 'tools': [{'type': 'function',

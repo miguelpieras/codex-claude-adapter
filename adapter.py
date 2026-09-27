@@ -218,8 +218,7 @@ class Handler(BaseHTTPRequestHandler):
             self.server.native.cancel(thread_id)
         except Exception as error:
             try:
-                stream.close_open()
-                stream.event('error', error={'code': 'claude_code_error', 'message': str(error)[:1200]})
+                stream.finish(str(error)[:1200], {})  # Codex ignores a bare SSE error event
             except OSError:
                 pass
         self.close_connection = True

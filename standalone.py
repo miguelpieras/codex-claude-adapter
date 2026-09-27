@@ -544,8 +544,10 @@ class ServiceHandler(Handler):
                 self.server.native.cancel(turn.tid)
             if streaming:
                 try:
-                    stream.close_open()  # keep already-streamed progress in the task history
-                    stream.event('error', error={'code': 'claude_service_error', 'message': str(error)[:1200]})
+                    # Codex ignores a bare SSE error event and shows only "stream closed before
+                    # response.completed", so the reason (e.g. Claude's usage limit) ends the turn as
+                    # its answer. Already-streamed progress stays in the task history.
+                    stream.finish(str(error)[:1200], {})
                 except OSError:
                     pass
             else:
