@@ -452,6 +452,24 @@ class RelayTests(unittest.TestCase):
         finally:
             turn.http_lock.release()
 
+    def test_continuation_tolerates_per_request_metadata(self):
+        # Codex adds fields such as MCP attribution to a continuation after an MCP tool call.
+        call = next(v for v in self.post(self.request)['output'] if v['type'] == 'function_call')
+        meta = {**self.metadata, 'mcp_attribution': {'server': 'codex_app'}, 'window_id': 'w2'}
+        final = self.post({**self.request, 'client_metadata': {'x-codex-turn-metadata': json.dumps(meta)},
+                           'input': [call, {'type': 'function_call_output', 'call_id': call['call_id'], 'output': 'ok'}]})
+        self.assertEqual(final['output'][-1]['content'][0]['text'], 'host result received')
+
+    def test_changed_permissions_end_the_waiting_turn(self):
+        call = next(v for v in self.post(self.request)['output'] if v['type'] == 'function_call')
+        meta = {**self.metadata, 'sandbox_mode': 'danger-full-access'}
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.post({**self.request, 'client_metadata': {'x-codex-turn-metadata': json.dumps(meta)},
+                       'input': [call, {'type': 'function_call_output', 'call_id': call['call_id'], 'output': 'ok'}]})
+        self.assertIn(b'sandbox_mode', caught.exception.read())
+        caught.exception.close()
+        self.assertTrue(self.server.turns[self.tid].done.wait(2))  # Claude is not left waiting for the tool
+
     def test_claude_failure_is_shown_as_the_answer(self):
         # Codex ignores a bare SSE error event and reports only "stream closed before response.completed".
         self.server.native.infer = Mock(side_effect=ValueError('Claude Code did not finish successfully.'))

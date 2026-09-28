@@ -29,6 +29,10 @@ SHELL = ('exec_command', 'write_stdin')  # Codex's own shell: native rows, sandb
 ESCALATION = ('sandbox_permissions', 'justification', 'prefix_rule')  # rejected by Codex under Full access
 APPROVAL_WAIT = 3600  # seconds a Claude permission question waits for the user
 QUESTION_LIMIT = 4000  # longer requests are denied rather than shown truncated
+# Turn metadata that decides a task's model, permissions and workspace. Codex also sends
+# per-request fields (e.g. MCP attribution after an MCP tool call) that change within a turn.
+ATTRIBUTION = ('thread_id', 'turn_id', 'model', 'sandbox_mode', 'auto_review_enabled', 'reasoning_effort',
+               'forked_from_thread_id', 'parent_thread_id', 'subagent_kind', 'request_kind', 'workspaces')
 SYSTEM = native.SYSTEM.replace('Other Codex app connectors and\nvoice are unavailable.',
     'Explicitly exposed Codex task coordination MCP tools are also available. Voice is unavailable.').replace(
     'different provider, explain that they must switch this task\'s dropdown.',
@@ -463,11 +467,16 @@ class ServiceHandler(Handler):
                     turn = Turn(tid, request, metadata)
                     turn.log = rollout_log(self.server.home, tid)
                     self.server.turns[tid] = turn
-                elif turn.metadata != metadata or turn.model != request['model']:
-                    raise ValueError('Continuation changed task attribution or model.')
                 locked = turn.http_lock.acquire(blocking=False)
                 if not locked:
                     raise ValueError('Concurrent HTTP request for one task.')
+                if not fresh:
+                    # Checked while locked, so a rejected continuation also ends the Claude run waiting for it.
+                    changed = [k for k in ATTRIBUTION if k != 'workspaces' and turn.metadata.get(k) != metadata.get(k)]
+                    if sorted(turn.metadata.get('workspaces') or {}) != sorted(metadata.get('workspaces') or {}):
+                        changed.append('workspaces')
+                    if changed or turn.model != request['model']:
+                        raise ValueError('Continuation changed task attribution or model: ' + ', '.join(changed or ['model']) + '.')
             if not fresh:
                 matches = [item for item in request.get('input', []) if item.get('type') == 'function_call_output' and item.get('call_id') == turn.pending]
                 if len(matches) != 1 or not turn.pending or turn.stopped.is_set():
